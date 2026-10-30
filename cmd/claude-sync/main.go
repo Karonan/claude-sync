@@ -73,6 +73,7 @@ func main() {
 		updateCmd(),
 		changelogCmd(),
 		mcpCmd(),
+		desktopCmd(),
 		autoCmd(),
 		pathsCmd(),
 	)
@@ -1011,7 +1012,7 @@ func runWebDAVWizard(webdavURL, username, password, pathPrefix string) (*storage
 }
 
 func pushCmd() *cobra.Command {
-	var includeMCP bool
+	var includeMCP, includeDesktop bool
 
 	cmd := &cobra.Command{
 		Use:   "push",
@@ -1109,16 +1110,23 @@ func pushCmd() *cobra.Command {
 				}
 			}
 
+			if includeDesktop || cfg.IsDesktopSyncEnabled() {
+				if err := runDesktopPush(ctx, syncer); err != nil {
+					return err
+				}
+			}
+
 			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
+	cmd.Flags().BoolVar(&includeDesktop, "include-desktop", false, "Sync the desktop app's chat list even if 'desktop disable' turned it off")
 	return cmd
 }
 
 func pullCmd() *cobra.Command {
-	var dryRun, force, includeMCP, rebuildHistory bool
+	var dryRun, force, includeMCP, includeDesktop, rebuildHistory bool
 
 	cmd := &cobra.Command{
 		Use:   "pull",
@@ -1247,6 +1255,13 @@ Examples:
 				}
 			}
 
+			// Runs after the file pull so the transcripts it links to are present
+			if (includeDesktop || cfg.IsDesktopSyncEnabled()) && !dryRun {
+				if err := runDesktopPull(ctx, syncer); err != nil {
+					return err
+				}
+			}
+
 			// Rebuild prompt history from the freshly-pulled session files.
 			if rebuildHistory && !dryRun {
 				if err := runHistoryRebuild(); err != nil {
@@ -1261,6 +1276,7 @@ Examples:
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing files without confirmation")
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
+	cmd.Flags().BoolVar(&includeDesktop, "include-desktop", false, "Sync the desktop app's chat list even if 'desktop disable' turned it off")
 	cmd.Flags().BoolVar(&rebuildHistory, "rebuild-history", false, "Rebuild ~/.claude/history.jsonl from session files after pulling")
 
 	return cmd
@@ -2930,6 +2946,126 @@ func mcpPullCmd() *cobra.Command {
 			return runMCPPull(ctx, syncer)
 		},
 	}
+}
+
+func desktopCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "desktop",
+		Short: "Manage Claude desktop app chat list sync",
+		Long: `Sync the Claude desktop app's sidebar entries across devices, so chats
+started in the desktop app or VS Code appear in its sidebar on every device.
+CLI-only sessions are still synced (resume them with 'claude --resume') but
+stay out of the desktop sidebar. Only adds entries; never changes or removes any.
+
+On by default as part of every push/pull; devices without the desktop app
+skip it. Turn it off with 'desktop disable'.`,
+	}
+	setDesktop := func(enabled bool) *cobra.Command {
+		use, short := "disable", "Stop including desktop chats in every push/pull"
+		if enabled {
+			use, short = "enable", "Include desktop chats in every push/pull"
+		}
+		return &cobra.Command{
+			Use:   use,
+			Short: short,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				cfg, err := config.Load()
+				if err != nil {
+					return err
+				}
+				cfg.DesktopSync = &enabled
+				if err := config.Save(cfg); err != nil {
+					return err
+				}
+				fmt.Printf("%s✓%s Desktop chat sync %sd.\n", colorGreen, colorReset, use)
+				if dir := cfg.GetDesktopSessionsDir(); dir == "" {
+					fmt.Printf("%s!%s Desktop app data not found; set desktop_sessions_dir in %s\n", colorYellow, colorReset, config.ConfigFilePath())
+				}
+				return nil
+			},
+		}
+	}
+	run := func(use, short string, fn func(context.Context, *sync.Syncer) error) *cobra.Command {
+		return &cobra.Command{
+			Use:   use,
+			Short: short,
+			RunE: func(cmd *cobra.Command, args []string) error {
+				cfg, err := config.Load()
+				if err != nil {
+					return err
+				}
+				syncer, err := sync.NewSyncer(cfg, quiet)
+				if err != nil {
+					return err
+				}
+				return fn(context.Background(), syncer)
+			},
+		}
+	}
+	cmd.AddCommand(
+		setDesktop(true),
+		setDesktop(false),
+		run("push", "Push this device's desktop chat list", runDesktopPush),
+		run("pull", "Add desktop chats from other devices to the sidebar", runDesktopPull),
+	)
+	return cmd
+}
+
+func runDesktopPush(ctx context.Context, syncer *sync.Syncer) error {
+	result, err := syncer.PushDesktop(ctx)
+	if err != nil {
+		return fmt.Errorf("desktop push failed: %w", err)
+	}
+	if quiet {
+		return nil
+	}
+	for _, title := range result.Generated {
+		fmt.Printf("  %s+%s %s\n", colorGreen, colorReset, title)
+	}
+	switch {
+	case result.NoDesktopDir:
+		fmt.Printf("%s⋯%s Desktop chats: desktop app data not found, skipped\n", colorDim, colorReset)
+	case result.Unchanged:
+		fmt.Printf("%s✓%s Desktop chats: no changes to push\n", colorGreen, colorReset)
+	default:
+		fmt.Printf("%s✓%s Desktop chats: %s%d pushed%s\n", colorGreen, colorReset, colorGreen, result.Pushed, colorReset)
+	}
+	if len(result.Generated) > 0 {
+		fmt.Printf("  %s%d VS Code/desktop chats added to this sidebar; restart the Claude desktop app to see them.%s\n", colorDim, len(result.Generated), colorReset)
+	}
+	return nil
+}
+
+func runDesktopPull(ctx context.Context, syncer *sync.Syncer) error {
+	result, err := syncer.PullDesktop(ctx)
+	if err != nil {
+		return fmt.Errorf("desktop pull failed: %w", err)
+	}
+	if quiet {
+		return nil
+	}
+	switch {
+	case result.NoDesktopDir:
+		fmt.Printf("%s⋯%s Desktop chats: desktop app data not found (open a chat in the app once), skipped\n", colorDim, colorReset)
+		return nil
+	case result.NoRemote:
+		fmt.Printf("%s⋯%s Desktop chats: no remote data found\n", colorDim, colorReset)
+	}
+	for _, title := range append(result.Added, result.Generated...) {
+		fmt.Printf("  %s+%s %s\n", colorGreen, colorReset, title)
+	}
+	fmt.Printf("%s✓%s Desktop chats: %s%d added%s", colorGreen, colorReset, colorGreen, len(result.Added)+len(result.Generated), colorReset)
+	if len(result.Generated) > 0 {
+		fmt.Printf(" (%d from VS Code/desktop transcripts)", len(result.Generated))
+	}
+	if result.Waiting > 0 {
+		fmt.Printf(", %d waiting for their transcript", result.Waiting)
+	}
+	fmt.Println()
+	if len(result.Added)+len(result.Generated) > 0 {
+		fmt.Printf("  %sRestart the Claude desktop app to see them.%s\n", colorDim, colorReset)
+	}
+	return nil
 }
 
 func runMCPPush(ctx context.Context, syncer *sync.Syncer) error {

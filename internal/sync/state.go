@@ -33,6 +33,11 @@ type SyncState struct {
 	// MCPBaseline stores the last-synced normalized MCP server configs for three-way merge.
 	MCPBaseline json.RawMessage `json:"mcp_baseline,omitempty"`
 
+	// DesktopSeen lists CLI session ids whose desktop sidebar entry has existed
+	// on this device. Pull never recreates these, so a chat deleted in the
+	// desktop app stays deleted.
+	DesktopSeen []string `json:"desktop_seen,omitempty"`
+
 	// savePath is the custom path to save state to (if set)
 	savePath string     `json:"-"`
 	mu       sync.Mutex `json:"-"`
