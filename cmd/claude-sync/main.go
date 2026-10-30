@@ -1566,7 +1566,9 @@ func batchResolveConflicts(conflicts []conflictFile, keep string, claudeDir stri
 		}
 
 		// Update state with the resolved file's hash
+		// State keys use "/" (as GetLocalFiles does), or Windows gets a duplicate entry
 		relPath, _ := filepath.Rel(claudeDir, c.OriginalPath)
+		relPath = filepath.ToSlash(relPath)
 		if info, err := os.Stat(c.OriginalPath); err == nil {
 			if hash, err := sync.HashFile(c.OriginalPath); err == nil {
 				state.UpdateFile(relPath, info, hash)
@@ -1601,6 +1603,7 @@ func interactiveResolveConflicts(conflicts []conflictFile, claudeDir string, sta
 	resolved := 0
 	for i, c := range conflicts {
 		relOriginal, _ := filepath.Rel(claudeDir, c.OriginalPath)
+		relOriginal = filepath.ToSlash(relOriginal) // state keys use "/"
 
 		// Get file sizes for context
 		localInfo, _ := os.Stat(c.OriginalPath)

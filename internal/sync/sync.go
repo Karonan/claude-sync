@@ -146,7 +146,7 @@ func (s *Syncer) progress(event ProgressEvent) {
 }
 
 func (s *Syncer) isExcluded(relPath string) bool {
-	return s.cfg.IsExcluded(relPath)
+	return IsConflictCopy(relPath) || s.cfg.IsExcluded(relPath)
 }
 
 // syncPaths returns the set of ~/.claude paths to sync, honoring both the
@@ -327,9 +327,8 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 		if !localExists {
 			shouldDownload = true
 		} else if stateFile != nil {
-			// Check if remote is newer than our last known state
-			if remoteObj.LastModified.After(stateFile.Uploaded) {
-				// Remote was updated after we last uploaded
+			// Check if remote changed since the version we last synced
+			if stateFile.RemoteChanged(remoteObj.LastModified) {
 				// Check if local was also modified
 				localHash, _ := HashFile(filepath.Join(s.claudeDir, localPath))
 				if localHash != stateFile.Hash {
@@ -341,10 +340,16 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 					})
 					if err := s.handleConflict(ctx, localPath, remoteObj); err != nil {
 						result.Errors = append(result.Errors, err)
+					} else {
+						// This remote version is saved; don't copy it again on every pull
+						s.state.MarkRemote(localPath, remoteObj.LastModified)
 					}
 					continue
 				}
 				shouldDownload = true
+			} else if stateFile.RemoteModTime.IsZero() {
+				// Remote is the version we synced: backfill state written by older versions
+				s.state.MarkRemote(localPath, remoteObj.LastModified)
 			}
 		} else if localInfo.ModTime().Before(remoteObj.LastModified) {
 			shouldDownload = true
@@ -398,6 +403,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 					mu.Unlock()
 					return
 				}
+				s.state.MarkRemote(task.localPath, task.remoteObj.LastModified)
 				mu.Lock()
 				result.Downloaded = append(result.Downloaded, task.localPath)
 				mu.Unlock()
@@ -458,6 +464,10 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	hash, _ := HashFile(fullPath)
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
+	// Best-effort: without it, the next pull falls back to this device's clock
+	if obj, err := s.storage.Head(ctx, remoteKey); err == nil {
+		s.state.MarkRemote(relativePath, obj.LastModified)
+	}
 
 	return nil
 }
@@ -733,9 +743,8 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 			fp.RemoteOnly = true
 			preview.WouldDownload = append(preview.WouldDownload, fp)
 		} else if stateFile != nil {
-			// Check if remote is newer than our last known state
-			if remoteObj.LastModified.After(stateFile.Uploaded) {
-				// Remote was updated after we last uploaded
+			// Check if remote changed since the version we last synced
+			if stateFile.RemoteChanged(remoteObj.LastModified) {
 				localHash, _ := HashFile(filepath.Join(s.claudeDir, localPath))
 				if localHash != stateFile.Hash {
 					// Conflict: both changed
@@ -813,7 +822,7 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 			stateFile := s.state.GetFile(relPath)
 			if stateFile != nil {
 				localHash, _ := HashFile(filepath.Join(s.claudeDir, relPath))
-				if localHash != stateFile.Hash || remoteObj.LastModified.After(stateFile.Uploaded) {
+				if localHash != stateFile.Hash || stateFile.RemoteChanged(remoteObj.LastModified) {
 					entries = append(entries, DiffEntry{
 						Path:       relPath,
 						Status:     "modified",

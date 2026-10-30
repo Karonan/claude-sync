@@ -21,6 +21,27 @@ type FileState struct {
 	Size     int64     `json:"size"`
 	ModTime  time.Time `json:"mod_time"`
 	Uploaded time.Time `json:"uploaded,omitempty"`
+	// RemoteModTime is the storage server's LastModified for the version this
+	// device last synced. Comparing server time to server time keeps clock
+	// skew between this device and the server from faking conflicts.
+	RemoteModTime time.Time `json:"remote_mod_time,omitempty"`
+}
+
+// RemoteChanged reports whether the remote object moved past the version this
+// device last synced.
+func (f *FileState) RemoteChanged(remoteModTime time.Time) bool {
+	if !f.RemoteModTime.IsZero() {
+		return remoteModTime.After(f.RemoteModTime)
+	}
+	// State written before RemoteModTime existed: fall back to this device's clock.
+	return remoteModTime.After(f.Uploaded)
+}
+
+// IsConflictCopy reports whether relPath is a local conflict copy
+// (path.conflict.<timestamp>). These stay on the device that made them:
+// synced, they show up on other devices as stale "remote" versions.
+func IsConflictCopy(relPath string) bool {
+	return strings.Contains(relPath, ".conflict.")
 }
 
 type SyncState struct {
@@ -157,6 +178,15 @@ func (s *SyncState) MarkUploaded(relativePath string) {
 	defer s.mu.Unlock()
 	if f, ok := s.Files[relativePath]; ok {
 		f.Uploaded = time.Now()
+	}
+}
+
+// MarkRemote records the server's LastModified for the version just synced.
+func (s *SyncState) MarkRemote(relativePath string, remoteModTime time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.Files[relativePath]; ok {
+		f.RemoteModTime = remoteModTime
 	}
 }
 
@@ -361,6 +391,11 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeF
 	s.mu.Unlock()
 
 	for _, relPath := range knownPaths {
+		// Conflict copies synced by older versions are no longer listed locally;
+		// don't let that silently delete them from remote.
+		if IsConflictCopy(relPath) {
+			continue
+		}
 		if _, exists := localFiles[relPath]; !exists {
 			changes = append(changes, FileChange{
 				Path:   relPath,

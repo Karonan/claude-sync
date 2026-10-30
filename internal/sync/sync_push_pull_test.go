@@ -663,3 +663,92 @@ func TestPullSetsRestrictivePermissions(t *testing.T) {
 		t.Errorf("Expected dir mode 0700, got %o", got)
 	}
 }
+
+// A device whose clock lags the storage server must not see its own push as a
+// remote change: that faked conflicts for chats still being written.
+func TestNoConflictFromClockSkewOnOwnPush(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+
+	writeFile(t, env.claudeDir, "history.jsonl", "line1\n")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+
+	// Server clock runs a minute ahead of this device's
+	env.syncer.state.Files["history.jsonl"].Uploaded = time.Now().Add(-time.Minute)
+
+	writeFile(t, env.claudeDir, "history.jsonl", "line1\nline2\n")
+	result, err := env.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	if len(result.Conflicts) != 0 {
+		t.Errorf("Expected no conflict, got %v", result.Conflicts)
+	}
+}
+
+func TestConflictNotRecreatedOnEveryPull(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+
+	writeFile(t, env.claudeDir, "history.jsonl", "line1\n")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	writeFile(t, env.claudeDir, "history.jsonl", "line1\nlocal\n")
+	encrypted, _ := env.syncer.encryptor.Encrypt([]byte("line1\nremote\n"))
+	time.Sleep(10 * time.Millisecond)
+	if err := env.store.Upload(ctx, "history.jsonl.age", encrypted); err != nil {
+		t.Fatalf("Upload to mock failed: %v", err)
+	}
+
+	first, err := env.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	second, err := env.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Second pull failed: %v", err)
+	}
+	if len(first.Conflicts) != 1 || len(second.Conflicts) != 0 {
+		t.Errorf("Expected 1 then 0 conflicts, got %v then %v", first.Conflicts, second.Conflicts)
+	}
+}
+
+func TestConflictCopiesStayLocal(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	const copyName = "history.jsonl.conflict.20260101-000000"
+
+	// Push never uploads a local conflict copy
+	writeFile(t, env.claudeDir, copyName, "old\n")
+	writeFile(t, env.claudeDir, "CLAUDE.md", "# x")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if _, err := env.store.Head(ctx, copyName+".age"); err == nil {
+		t.Error("Conflict copy was uploaded")
+	}
+
+	// One synced by an older version is neither pulled nor deleted from remote
+	encrypted, _ := env.syncer.encryptor.Encrypt([]byte("stale\n"))
+	if err := env.store.Upload(ctx, "projects/p/s.jsonl.conflict.20260101-000000.age", encrypted); err != nil {
+		t.Fatalf("Upload to mock failed: %v", err)
+	}
+	env.syncer.state.Files["projects/p/s.jsonl.conflict.20260101-000000"] = &FileState{Path: "projects/p/s.jsonl.conflict.20260101-000000"}
+	result, err := env.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	if len(result.Downloaded) != 0 {
+		t.Errorf("Expected no downloads, got %v", result.Downloaded)
+	}
+	writeFile(t, env.claudeDir, "CLAUDE.md", "# y")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if _, err := env.store.Head(ctx, "projects/p/s.jsonl.conflict.20260101-000000.age"); err != nil {
+		t.Error("Remote conflict copy was deleted by push")
+	}
+}
