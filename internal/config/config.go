@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -20,6 +21,10 @@ const (
 	// MCPRemoteKey is the remote storage key for synced MCP server configs.
 	// The _external/ prefix separates it from ~/.claude/-relative files.
 	MCPRemoteKey = "_external/mcp-servers.json"
+
+	// DesktopRemoteKey is the remote storage key for synced Claude desktop app
+	// sidebar entries (one per desktop chat, keyed by CLI session id).
+	DesktopRemoteKey = "_external/desktop-sessions.json"
 
 	// Sync scopes control which subset of ~/.claude is synced.
 	// ScopeFull (default) syncs everything in SyncPaths; ScopeSessions limits
@@ -58,6 +63,15 @@ type Config struct {
 	// and explicitly disabled (false). Nil is treated as disabled for backward
 	// compatibility with existing configs.
 	MCPSync *bool `yaml:"mcp_sync,omitempty"`
+
+	// DesktopSync enables syncing the Claude desktop app's chat list, so chats
+	// started in the desktop app show up in its sidebar on other devices while
+	// CLI-only sessions stay out of it. Nil is treated as disabled.
+	DesktopSync *bool `yaml:"desktop_sync,omitempty"`
+
+	// DesktopSessionsDir overrides auto-detection of the desktop app's
+	// claude-code-sessions directory. Must be an absolute path.
+	DesktopSessionsDir string `yaml:"desktop_sessions_dir,omitempty"`
 
 	// PathMap maps local directory prefixes to shared token names so project
 	// sessions stay resumable across devices with different layouts.
@@ -315,6 +329,49 @@ func (c *Config) IsMCPSyncEnabled() bool {
 // SetMCPSync sets the MCP sync state. Pass true to enable, false to explicitly disable.
 func (c *Config) SetMCPSync(enabled bool) {
 	c.MCPSync = &enabled
+}
+
+// IsDesktopSyncEnabled returns true if desktop chat sync is explicitly enabled.
+func (c *Config) IsDesktopSyncEnabled() bool {
+	return c.DesktopSync != nil && *c.DesktopSync
+}
+
+// GetDesktopSessionsDir returns the configured desktop sessions directory, or
+// the auto-detected one. Empty means the desktop app was not found.
+func (c *Config) GetDesktopSessionsDir() string {
+	if c.DesktopSessionsDir != "" {
+		return c.DesktopSessionsDir
+	}
+	return DesktopSessionsDirPath()
+}
+
+// DesktopSessionsDirPath locates the Claude desktop app's claude-code-sessions
+// directory, which holds one sidebar entry (local_<id>.json) per desktop chat
+// under <account>/<org>/. Returns "" when no install is found.
+func DesktopSessionsDirPath() string {
+	home, _ := os.UserHomeDir()
+	var candidates []string
+	switch runtime.GOOS {
+	case "windows":
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			// Microsoft Store (MSIX) installs keep app data here
+			m, _ := filepath.Glob(filepath.Join(local, "Claude-Data", "claude_*", "claude-code-sessions"))
+			candidates = append(candidates, m...)
+		}
+		if roaming := os.Getenv("APPDATA"); roaming != "" {
+			candidates = append(candidates, filepath.Join(roaming, "Claude", "claude-code-sessions"))
+		}
+	case "darwin":
+		candidates = append(candidates, filepath.Join(home, "Library", "Application Support", "Claude", "claude-code-sessions"))
+	default:
+		candidates = append(candidates, filepath.Join(home, ".config", "Claude", "claude-code-sessions"))
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 // IsExcluded returns true if the given relative path matches any exclude pattern.

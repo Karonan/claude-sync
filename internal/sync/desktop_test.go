@@ -1,0 +1,194 @@
+package sync
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/tawanorg/claude-sync/internal/config"
+)
+
+// desktopDevice is one simulated machine: its syncer, ~/.claude, and the
+// desktop app's sessions folder (with the <account>/<org> layout).
+type desktopDevice struct {
+	syncer    *Syncer
+	claudeDir string
+	entryDir  string
+}
+
+func newDesktopDevice(t *testing.T, store *mockStorage, from *Syncer) *desktopDevice {
+	t.Helper()
+	tmp := t.TempDir()
+	claudeDir := filepath.Join(tmp, ".claude")
+	stateDir := filepath.Join(tmp, ".claude-sync")
+	sessions := filepath.Join(tmp, "claude-code-sessions")
+	entryDir := filepath.Join(sessions, "acct", "org")
+	for _, d := range []string{claudeDir, stateDir, entryDir} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := LoadStateFromDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := testEncryptor(t, stateDir)
+	if from != nil {
+		enc = from.encryptor
+	}
+	cfg := &config.Config{DesktopSessionsDir: sessions}
+	return &desktopDevice{NewSyncerWith(cfg, store, enc, state, claudeDir, true), claudeDir, entryDir}
+}
+
+func (d *desktopDevice) addEntry(t *testing.T, sessionID, cliID, cwd, title string) {
+	t.Helper()
+	data, _ := json.Marshal(map[string]any{"sessionId": sessionID, "cliSessionId": cliID, "cwd": cwd, "title": title, "model": "m"})
+	if err := os.WriteFile(filepath.Join(d.entryDir, sessionID+".json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (d *desktopDevice) addTranscript(t *testing.T, cliID string) {
+	t.Helper()
+	createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", cliID+".jsonl"), `{"type":"user"}`+"\n")
+}
+
+func (d *desktopDevice) entries(t *testing.T) DesktopEntries {
+	t.Helper()
+	e, _, err := ReadDesktopEntries(filepath.Dir(filepath.Dir(d.entryDir)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+func TestDesktopPullAddsOnlyDesktopChats(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+
+	home, _ := os.UserHomeDir()
+	cwd := filepath.Join(home, "proj")
+	a.addEntry(t, "local_1", "cli-desktop", cwd, "Desktop chat")
+	a.addEntry(t, "local_2", "cli-later", cwd, "Transcript not pulled yet")
+	if r, err := a.syncer.PushDesktop(ctx); err != nil || r.Pushed != 2 {
+		t.Fatalf("push: %+v %v", r, err)
+	}
+
+	b.addEntry(t, "local_own", "cli-own", cwd, "B's own chat")
+	b.addTranscript(t, "cli-desktop")
+	b.addTranscript(t, "cli-only") // a CLI session: no desktop entry anywhere
+
+	r, err := b.syncer.PullDesktop(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Added) != 1 || r.Added[0] != "Desktop chat" || r.Waiting != 1 {
+		t.Fatalf("pull result: %+v", r)
+	}
+	got := b.entries(t)
+	if _, ok := got["cli-only"]; ok {
+		t.Error("CLI-only session must not get a sidebar entry")
+	}
+	var h struct{ Cwd string }
+	_ = json.Unmarshal(got["cli-desktop"], &h)
+	if h.Cwd != cwd {
+		t.Errorf("cwd = %q, want %q", h.Cwd, cwd)
+	}
+
+	// Transcript arrives later: the waiting entry is added on the next pull
+	b.addTranscript(t, "cli-later")
+	if r, _ = b.syncer.PullDesktop(ctx); len(r.Added) != 1 || r.Waiting != 0 {
+		t.Fatalf("second pull: %+v", r)
+	}
+}
+
+func TestDesktopPushKeepsOtherDevicesEntries(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+
+	a.addEntry(t, "local_a", "cli-a", "/x", "A")
+	b.addEntry(t, "local_b", "cli-b", "/x", "B")
+	if _, err := a.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := a.syncer.downloadDesktopEntries(ctx)
+	if err != nil || len(remote) != 2 {
+		t.Fatalf("remote = %v, %v; want both devices' entries", remote, err)
+	}
+	if r, _ := b.syncer.PushDesktop(ctx); !r.Unchanged {
+		t.Error("repeat push should be unchanged")
+	}
+}
+
+func TestDesktopPullNeverResurrectsOrOverwrites(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+
+	a.addEntry(t, "local_1", "cli-1", "/x", "Remote title")
+	a.addEntry(t, "local_2", "cli-2", "/x", "Deleted on B")
+	if _, err := a.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.addTranscript(t, "cli-1")
+	b.addTranscript(t, "cli-2")
+	b.addEntry(t, "local_mine", "cli-1", "/x", "Local title")
+	if _, err := b.syncer.PullDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// User deletes the pulled chat on B; the next pull must not bring it back
+	if err := os.Remove(filepath.Join(b.entryDir, "local_2.json")); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := b.syncer.PullDesktop(ctx); len(r.Added) != 0 {
+		t.Fatalf("deleted chat came back: %+v", r)
+	}
+	var h desktopEntryHeader
+	_ = json.Unmarshal(b.entries(t)["cli-1"], &h)
+	if h.Title != "Local title" {
+		t.Errorf("existing entry was changed: %q", h.Title)
+	}
+}
+
+func TestDesktopPullRejectsUnsafeSessionID(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+
+	a.addEntry(t, "local_ok", "cli-1", "/x", "x")
+	if _, err := a.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Tamper with the remote entry so its sessionId escapes the folder
+	remote, _ := a.syncer.downloadDesktopEntries(ctx)
+	remote["cli-1"] = json.RawMessage(`{"sessionId":"local_../../evil","cliSessionId":"cli-1"}`)
+	data, _ := json.Marshal(remote)
+	enc, _ := a.syncer.encryptor.Encrypt(data)
+	_ = store.Upload(ctx, config.DesktopRemoteKey+".age", enc)
+
+	b.addEntry(t, "local_seed", "cli-seed", "/x", "seed")
+	b.addTranscript(t, "cli-1")
+	if r, err := b.syncer.PullDesktop(ctx); err != nil || len(r.Added) != 0 {
+		t.Fatalf("unsafe entry written: %+v %v", r, err)
+	}
+}
+
+func TestDesktopNoAppDir(t *testing.T) {
+	s, _, _ := testSyncer(t)
+	s.cfg.DesktopSessionsDir = filepath.Join(t.TempDir(), "missing")
+	// An explicit but empty dir means no entries; pull reports no remote
+	if r, err := s.PullDesktop(context.Background()); err != nil || !r.NoRemote {
+		t.Fatalf("pull: %+v %v", r, err)
+	}
+}
