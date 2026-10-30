@@ -242,6 +242,17 @@ func TestDesktopPullAdoptsVSCodeAndDesktopTranscripts(t *testing.T) {
 		t.Errorf("desk title = %q", desk.Title)
 	}
 
+	// A later VS Code chat is adopted by push, and its entry is uploaded
+	write("vs2", "claude-vscode")
+	pr, err := d.syncer.PushDesktop(ctx)
+	if err != nil || len(pr.Generated) != 1 {
+		t.Fatalf("push: %+v %v", pr, err)
+	}
+	remote, _ := d.syncer.downloadDesktopEntries(ctx)
+	if _, ok := remote["vs2"]; !ok {
+		t.Error("push should upload the adopted entry")
+	}
+
 	// Deleting an adopted chat keeps it gone
 	if err := os.Remove(filepath.Join(d.entryDir, vs.SessionID+".json")); err != nil {
 		t.Fatal(err)

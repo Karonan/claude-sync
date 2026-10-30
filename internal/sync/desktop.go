@@ -24,6 +24,7 @@ type DesktopEntries map[string]json.RawMessage
 // DesktopPushResult describes the outcome of pushing desktop chat entries.
 type DesktopPushResult struct {
 	Pushed       int
+	Generated    []string // titles of entries built from VS Code/desktop transcripts
 	Unchanged    bool
 	NoDesktopDir bool
 }
@@ -125,10 +126,22 @@ func (s *Syncer) decryptRemote(ctx context.Context, key string) ([]byte, error) 
 
 // PushDesktop merges this device's desktop chat entries into the remote set.
 // Entries from other devices are kept, so devices never overwrite each other.
+// Local VS Code/desktop transcripts without an entry get one first, so they
+// show up here right away and other devices receive the finished entry.
 func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 	dir := s.cfg.GetDesktopSessionsDir()
 	if dir == "" {
 		return &DesktopPushResult{NoDesktopDir: true}, nil
+	}
+	_, writeDir, err := ReadDesktopEntries(dir)
+	if err != nil {
+		return nil, err
+	}
+	var generated []string
+	if writeDir != "" {
+		if generated, err = s.adoptTranscripts(writeDir); err != nil {
+			return nil, err
+		}
 	}
 	local, _, err := ReadDesktopEntries(dir)
 	if err != nil {
@@ -154,7 +167,7 @@ func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize desktop entries: %w", err)
 	}
-	result := &DesktopPushResult{Pushed: len(local)}
+	result := &DesktopPushResult{Pushed: len(local), Generated: generated}
 	if remote != nil && string(before) == string(data) {
 		result.Unchanged = true
 	} else {
@@ -238,7 +251,7 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 		result.Added = append(result.Added, h.Title)
 	}
 
-	if err := s.adoptTranscripts(writeDir, result); err != nil {
+	if result.Generated, err = s.adoptTranscripts(writeDir); err != nil {
 		return nil, err
 	}
 
@@ -259,10 +272,10 @@ var desktopTemplateDrop = []string{"postTurnSummary", "postTurnSummaryFor", "pre
 // the desktop app or VS Code that has none, e.g. VS Code chats (which never
 // get an entry of their own) or desktop chats from a device that hasn't pushed
 // its entries. New entries copy the newest local entry's settings.
-func (s *Syncer) adoptTranscripts(writeDir string, result *DesktopPullResult) error {
+func (s *Syncer) adoptTranscripts(writeDir string) (generated []string, err error) {
 	local, _, err := ReadDesktopEntries(filepath.Dir(filepath.Dir(writeDir)))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var template map[string]json.RawMessage
 	var newest time.Time
@@ -279,7 +292,7 @@ func (s *Syncer) adoptTranscripts(writeDir string, result *DesktopPullResult) er
 		}
 	}
 	if template == nil {
-		return nil
+		return nil, nil
 	}
 
 	transcripts, _ := filepath.Glob(filepath.Join(s.claudeDir, "projects", "*", "*.jsonl"))
@@ -289,10 +302,10 @@ func (s *Syncer) adoptTranscripts(writeDir string, result *DesktopPullResult) er
 		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) {
 			continue
 		}
-		// shortcut: rereads unadopted CLI transcripts on every pull; cache by mtime if pulls get slow
+		// shortcut: rereads unadopted CLI transcripts on every push/pull; cache by mtime if they get slow
 		info, err := readTranscriptInfo(tr)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !info.sidebar || info.cwd == "" || info.title == "" {
 			continue
@@ -324,15 +337,15 @@ func (s *Syncer) adoptTranscripts(writeDir string, result *DesktopPullResult) er
 		}
 		data, err := json.Marshal(entry)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := os.WriteFile(filepath.Join(writeDir, sessionID+".json"), data, 0600); err != nil {
-			return fmt.Errorf("failed to write desktop entry: %w", err)
+			return nil, fmt.Errorf("failed to write desktop entry: %w", err)
 		}
 		s.state.markDesktopSeen(id)
-		result.Generated = append(result.Generated, info.title)
+		generated = append(generated, info.title)
 	}
-	return nil
+	return generated, nil
 }
 
 type transcriptInfo struct {

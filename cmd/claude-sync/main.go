@@ -3016,6 +3016,9 @@ func runDesktopPush(ctx context.Context, syncer *sync.Syncer) error {
 	if quiet {
 		return nil
 	}
+	for _, title := range result.Generated {
+		fmt.Printf("  %s+%s %s\n", colorGreen, colorReset, title)
+	}
 	switch {
 	case result.NoDesktopDir:
 		fmt.Printf("%s⋯%s Desktop chats: desktop app data not found, skipped\n", colorDim, colorReset)
@@ -3023,6 +3026,9 @@ func runDesktopPush(ctx context.Context, syncer *sync.Syncer) error {
 		fmt.Printf("%s✓%s Desktop chats: no changes to push\n", colorGreen, colorReset)
 	default:
 		fmt.Printf("%s✓%s Desktop chats: %s%d pushed%s\n", colorGreen, colorReset, colorGreen, result.Pushed, colorReset)
+	}
+	if len(result.Generated) > 0 {
+		fmt.Printf("  %s%d VS Code/desktop chats added to this sidebar; restart the Claude desktop app to see them.%s\n", colorDim, len(result.Generated), colorReset)
 	}
 	return nil
 }
