@@ -261,3 +261,58 @@ func TestDesktopPullAdoptsVSCodeAndDesktopTranscripts(t *testing.T) {
 		t.Fatalf("adopted again: %v", r.Generated)
 	}
 }
+
+// A chat started in the CLI never gets a sidebar entry through sync, even
+// when it was later resumed in the desktop app or an older build pushed it.
+func TestDesktopSyncLeavesOutCLIStartedChats(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+	transcript := func(d *desktopDevice, id string, entrypoints ...string) {
+		var lines string
+		for _, ep := range entrypoints {
+			lines += `{"type":"user","entrypoint":"` + ep + `"}` + "\n"
+		}
+		createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", id+".jsonl"), lines)
+	}
+	for _, d := range []*desktopDevice{a, b} {
+		transcript(d, "desk", "claude-desktop")
+		transcript(d, "resumed", "cli", "claude-desktop")
+		// A program ran `claude` from a desktop chat: inherited entrypoint, "sdk" turns
+		createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", "spawned.jsonl"),
+			`{"type":"user","entrypoint":"claude-desktop","turnOrigin":"sdk"}`+"\n")
+	}
+
+	a.addEntry(t, "local_1", "desk", "/proj", "Desktop chat")
+	a.addEntry(t, "local_2", "resumed", "/proj", "CLI chat opened in desktop")
+	a.addEntry(t, "local_3", "spawned", "/proj", "say hi")
+	if r, err := a.syncer.PushDesktop(ctx); err != nil || r.Pushed != 1 {
+		t.Fatalf("push: %+v %v", r, err)
+	}
+	remote, _ := a.syncer.downloadDesktopEntries(ctx)
+	if _, ok := remote["resumed"]; ok {
+		t.Error("push uploaded a CLI-started chat")
+	}
+
+	// As an older build would have: the CLI chat's entry is in the remote list
+	remote["resumed"] = json.RawMessage(`{"sessionId":"local_2","cliSessionId":"resumed","title":"CLI chat opened in desktop"}`)
+	data, _ := json.Marshal(remote)
+	compressed, _ := gzipCompress(data)
+	encrypted, _ := a.syncer.encryptor.Encrypt(compressed)
+	if err := store.Upload(ctx, config.DesktopRemoteKey+".age", encrypted); err != nil {
+		t.Fatal(err)
+	}
+
+	b.addEntry(t, "local_own", "own", "/proj", "B's own chat") // pull needs the app's folder
+	r, err := b.syncer.PullDesktop(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Added) != 1 || r.Added[0] != "Desktop chat" {
+		t.Fatalf("pull added %v, want only the desktop chat", r.Added)
+	}
+	if _, ok := b.entries(t)["resumed"]; ok {
+		t.Error("pull recreated a CLI-started chat")
+	}
+}

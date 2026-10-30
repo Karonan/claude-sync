@@ -2,7 +2,6 @@ package sync
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -157,8 +156,13 @@ func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 		merged[id] = raw
 	}
 	for id, raw := range local {
-		merged[id] = s.paths.NormalizeContent(desktopContentPath, raw)
 		s.state.markDesktopSeen(id)
+		// Chats started in the CLI stay out of every sidebar
+		if s.isCLIChat(id) {
+			delete(local, id)
+			continue
+		}
+		merged[id] = s.paths.NormalizeContent(desktopContentPath, raw)
 	}
 
 	// encoding/json sorts map keys, so equal sets marshal identically
@@ -227,6 +231,10 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 			result.Waiting++
 			continue
 		}
+		// Older builds pushed every entry, CLI chats included
+		if s.isCLIChat(id) {
+			continue
+		}
 		raw := s.paths.ResolveContent(desktopContentPath, remote[id])
 		var h desktopEntryHeader
 		if json.Unmarshal(raw, &h) != nil || h.CLISessionID != id || !desktopSessionIDRe.MatchString(h.SessionID) {
@@ -262,8 +270,46 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 }
 
 // sidebarEntrypoints are the apps whose sessions belong in the desktop sidebar.
-// CLI and SDK sessions ("cli", "sdk-cli", ...) are left out.
-var sidebarEntrypoints = [][]byte{[]byte(`"entrypoint":"claude-desktop"`), []byte(`"entrypoint":"claude-vscode"`)}
+// CLI and SDK sessions ("cli", "sdk-cli", ...) are left out, even when later
+// resumed in the desktop app: what counts is where the chat started.
+var sidebarEntrypoints = map[string]bool{"claude-desktop": true, "claude-vscode": true}
+
+// sidebarStart reports whether a chat whose first user message carries these
+// fields belongs in the sidebar. Programs that run `claude` from inside a
+// desktop chat inherit its entrypoint, but their turns are marked "sdk".
+func sidebarStart(entrypoint, turnOrigin string) bool {
+	return sidebarEntrypoints[entrypoint] && turnOrigin != "sdk"
+}
+
+// isCLIChat reports whether id's local transcript was started outside the
+// desktop app and VS Code, or by a program rather than a person. Without a
+// local transcript it can't tell: false.
+func (s *Syncer) isCLIChat(id string) bool {
+	m, _ := filepath.Glob(filepath.Join(s.claudeDir, "projects", "*", id+".jsonl"))
+	if len(m) == 0 {
+		return false
+	}
+	f, err := os.Open(m[0])
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	r := bufio.NewReader(f)
+	for {
+		line, err := r.ReadBytes('\n')
+		var l struct {
+			Type       string `json:"type"`
+			Entrypoint string `json:"entrypoint"`
+			TurnOrigin string `json:"turnOrigin"`
+		}
+		if json.Unmarshal(line, &l) == nil && l.Type == "user" && l.Entrypoint != "" {
+			return !sidebarStart(l.Entrypoint, l.TurnOrigin)
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
 
 // Run-specific fields of the template entry that must not carry over.
 var desktopTemplateDrop = []string{"postTurnSummary", "postTurnSummaryFor", "pregeneratedId", "interruptedAwaitingPerson", "latestUserFrameAt", "lastSpawnRootDetected", "lastAssistantUuid"}
@@ -365,24 +411,27 @@ func readTranscriptInfo(path string) (transcriptInfo, error) {
 	defer func() { _ = f.Close() }()
 
 	var aiTitle, userTitle string
+	var seenEntrypoint bool
 	r := bufio.NewReader(f)
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
-			for _, ep := range sidebarEntrypoints {
-				info.sidebar = info.sidebar || bytes.Contains(line, ep)
-			}
 			var l struct {
-				Type      string `json:"type"`
-				Cwd       string `json:"cwd"`
-				Timestamp string `json:"timestamp"`
-				UUID      string `json:"uuid"`
-				AITitle   string `json:"aiTitle"`
-				Message   struct {
+				Entrypoint string `json:"entrypoint"`
+				TurnOrigin string `json:"turnOrigin"`
+				Type       string `json:"type"`
+				Cwd        string `json:"cwd"`
+				Timestamp  string `json:"timestamp"`
+				UUID       string `json:"uuid"`
+				AITitle    string `json:"aiTitle"`
+				Message    struct {
 					Content json.RawMessage `json:"content"`
 				} `json:"message"`
 			}
 			if json.Unmarshal(line, &l) == nil {
+				if !seenEntrypoint && l.Type == "user" && l.Entrypoint != "" {
+					seenEntrypoint, info.sidebar = true, sidebarStart(l.Entrypoint, l.TurnOrigin)
+				}
 				if info.cwd == "" {
 					info.cwd = l.Cwd
 				}
