@@ -187,8 +187,66 @@ func TestDesktopPullRejectsUnsafeSessionID(t *testing.T) {
 func TestDesktopNoAppDir(t *testing.T) {
 	s, _, _ := testSyncer(t)
 	s.cfg.DesktopSessionsDir = filepath.Join(t.TempDir(), "missing")
-	// An explicit but empty dir means no entries; pull reports no remote
-	if r, err := s.PullDesktop(context.Background()); err != nil || !r.NoRemote {
+	if r, err := s.PullDesktop(context.Background()); err != nil || !r.NoDesktopDir {
 		t.Fatalf("pull: %+v %v", r, err)
+	}
+}
+
+func TestDesktopPullAdoptsVSCodeAndDesktopTranscripts(t *testing.T) {
+	ctx := context.Background()
+	d := newDesktopDevice(t, newMockStorage(), nil)
+	d.addEntry(t, "local_tpl", "cli-tpl", "/x", "template")
+
+	write := func(id, entrypoint string, extra ...string) {
+		lines := `{"type":"queue-operation","timestamp":"2026-01-01T00:00:00Z"}` + "\n" +
+			`{"type":"user","cwd":"/proj","entrypoint":"` + entrypoint + `","timestamp":"2026-01-02T00:00:00Z","message":{"content":[{"type":"text","text":"<ide_opened_file>x</ide_opened_file>"},{"type":"text","text":"Fix   the bug"}]}}` + "\n" +
+			`{"type":"assistant","uuid":"a1","timestamp":"2026-01-03T00:00:00Z"}` + "\n"
+		for _, e := range extra {
+			lines += e + "\n"
+		}
+		createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", id+".jsonl"), lines)
+	}
+	write("vs", "claude-vscode")
+	write("desk", "claude-desktop", `{"type":"ai-title","aiTitle":"Named by AI"}`)
+	write("cli", "cli")
+	write("sdk", "sdk-cli")
+
+	r, err := d.syncer.PullDesktop(ctx)
+	if err != nil || !r.NoRemote {
+		t.Fatalf("pull: %+v %v", r, err)
+	}
+	if len(r.Generated) != 2 {
+		t.Fatalf("generated = %v, want the VS Code and desktop chats", r.Generated)
+	}
+	got := d.entries(t)
+	for _, id := range []string{"cli", "sdk"} {
+		if _, ok := got[id]; ok {
+			t.Errorf("%s session must not get a sidebar entry", id)
+		}
+	}
+	var vs struct {
+		SessionID, Title, Cwd, LastAssistantUUID string
+		CreatedAt, LastActivityAt                int64
+		GitAnchors                               []any
+	}
+	_ = json.Unmarshal(got["vs"], &vs)
+	if vs.Title != "Fix the bug" || vs.Cwd != "/proj" || vs.LastAssistantUUID != "a1" || len(vs.GitAnchors) != 0 {
+		t.Errorf("vs entry = %+v", vs)
+	}
+	if vs.CreatedAt >= vs.LastActivityAt || !desktopSessionIDRe.MatchString(vs.SessionID) {
+		t.Errorf("bad timestamps or id: %+v", vs)
+	}
+	var desk desktopEntryHeader
+	_ = json.Unmarshal(got["desk"], &desk)
+	if desk.Title != "Named by AI" {
+		t.Errorf("desk title = %q", desk.Title)
+	}
+
+	// Deleting an adopted chat keeps it gone
+	if err := os.Remove(filepath.Join(d.entryDir, vs.SessionID+".json")); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ = d.syncer.PullDesktop(ctx); len(r.Generated) != 0 {
+		t.Fatalf("adopted again: %v", r.Generated)
 	}
 }

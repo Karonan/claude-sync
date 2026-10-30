@@ -3041,17 +3041,19 @@ func runDesktopPull(ctx context.Context, syncer *sync.Syncer) error {
 		return nil
 	case result.NoRemote:
 		fmt.Printf("%s⋯%s Desktop chats: no remote data found\n", colorDim, colorReset)
-		return nil
 	}
-	for _, title := range result.Added {
+	for _, title := range append(result.Added, result.Generated...) {
 		fmt.Printf("  %s+%s %s\n", colorGreen, colorReset, title)
 	}
-	fmt.Printf("%s✓%s Desktop chats: %s%d added%s", colorGreen, colorReset, colorGreen, len(result.Added), colorReset)
+	fmt.Printf("%s✓%s Desktop chats: %s%d added%s", colorGreen, colorReset, colorGreen, len(result.Added)+len(result.Generated), colorReset)
+	if len(result.Generated) > 0 {
+		fmt.Printf(" (%d from VS Code/desktop transcripts)", len(result.Generated))
+	}
 	if result.Waiting > 0 {
 		fmt.Printf(", %d waiting for their transcript", result.Waiting)
 	}
 	fmt.Println()
-	if len(result.Added) > 0 {
+	if len(result.Added)+len(result.Generated) > 0 {
 		fmt.Printf("  %sRestart the Claude desktop app to see them.%s\n", colorDim, colorReset)
 	}
 	return nil

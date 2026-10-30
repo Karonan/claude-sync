@@ -1,13 +1,17 @@
 package sync
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tawanorg/claude-sync/internal/config"
@@ -27,6 +31,7 @@ type DesktopPushResult struct {
 // DesktopPullResult describes the outcome of pulling desktop chat entries.
 type DesktopPullResult struct {
 	Added        []string // titles of chats added to the sidebar
+	Generated    []string // titles of entries built from VS Code/desktop transcripts
 	Waiting      int      // entries whose transcript hasn't been pulled yet
 	NoRemote     bool
 	NoDesktopDir bool
@@ -184,9 +189,6 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if remote == nil {
-		return &DesktopPullResult{NoRemote: true}, nil
-	}
 	local, writeDir, err := ReadDesktopEntries(dir)
 	if err != nil {
 		return nil, err
@@ -202,7 +204,8 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 	}
 	sort.Strings(ids)
 
-	result := &DesktopPullResult{}
+	// No remote yet still adopts local VS Code/desktop transcripts below
+	result := &DesktopPullResult{NoRemote: remote == nil}
 	for _, id := range ids {
 		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) {
 			continue
@@ -235,10 +238,208 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 		result.Added = append(result.Added, h.Title)
 	}
 
+	if err := s.adoptTranscripts(writeDir, result); err != nil {
+		return nil, err
+	}
+
 	if err := s.state.Save(); err != nil {
 		return nil, fmt.Errorf("failed to save state: %w", err)
 	}
 	return result, nil
+}
+
+// sidebarEntrypoints are the apps whose sessions belong in the desktop sidebar.
+// CLI and SDK sessions ("cli", "sdk-cli", ...) are left out.
+var sidebarEntrypoints = [][]byte{[]byte(`"entrypoint":"claude-desktop"`), []byte(`"entrypoint":"claude-vscode"`)}
+
+// Run-specific fields of the template entry that must not carry over.
+var desktopTemplateDrop = []string{"postTurnSummary", "postTurnSummaryFor", "pregeneratedId", "interruptedAwaitingPerson", "latestUserFrameAt", "lastSpawnRootDetected", "lastAssistantUuid"}
+
+// adoptTranscripts gives a sidebar entry to every local transcript started in
+// the desktop app or VS Code that has none, e.g. VS Code chats (which never
+// get an entry of their own) or desktop chats from a device that hasn't pushed
+// its entries. New entries copy the newest local entry's settings.
+func (s *Syncer) adoptTranscripts(writeDir string, result *DesktopPullResult) error {
+	local, _, err := ReadDesktopEntries(filepath.Dir(filepath.Dir(writeDir)))
+	if err != nil {
+		return err
+	}
+	var template map[string]json.RawMessage
+	var newest time.Time
+	files, _ := filepath.Glob(filepath.Join(writeDir, "local_*.json"))
+	for _, f := range files {
+		fi, err := os.Stat(f)
+		if err != nil || !fi.ModTime().After(newest) {
+			continue
+		}
+		data, _ := os.ReadFile(f)
+		var m map[string]json.RawMessage
+		if json.Unmarshal(data, &m) == nil {
+			template, newest = m, fi.ModTime()
+		}
+	}
+	if template == nil {
+		return nil
+	}
+
+	transcripts, _ := filepath.Glob(filepath.Join(s.claudeDir, "projects", "*", "*.jsonl"))
+	sort.Strings(transcripts)
+	for _, tr := range transcripts {
+		id := strings.TrimSuffix(filepath.Base(tr), ".jsonl")
+		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) {
+			continue
+		}
+		// shortcut: rereads unadopted CLI transcripts on every pull; cache by mtime if pulls get slow
+		info, err := readTranscriptInfo(tr)
+		if err != nil {
+			return err
+		}
+		if !info.sidebar || info.cwd == "" || info.title == "" {
+			continue
+		}
+
+		entry := make(map[string]json.RawMessage, len(template))
+		for k, v := range template {
+			entry[k] = v
+		}
+		for _, k := range desktopTemplateDrop {
+			delete(entry, k)
+		}
+		sessionID := "local_" + newUUID()
+		set := func(k string, v any) { entry[k], _ = json.Marshal(v) }
+		set("sessionId", sessionID)
+		set("cliSessionId", id)
+		set("cwd", info.cwd)
+		set("originCwd", info.cwd)
+		set("gitAnchors", []any{}) // the template's anchors belong to its own repo
+		set("createdAt", info.first.UnixMilli())
+		for _, k := range []string{"lastActivityAt", "lastTurnEdgeAt", "lastFocusedAt"} {
+			set(k, info.last.UnixMilli())
+		}
+		set("title", info.title)
+		set("titleSource", "auto")
+		set("isArchived", false)
+		if info.lastAssistant != "" {
+			set("lastAssistantUuid", info.lastAssistant)
+		}
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(writeDir, sessionID+".json"), data, 0600); err != nil {
+			return fmt.Errorf("failed to write desktop entry: %w", err)
+		}
+		s.state.markDesktopSeen(id)
+		result.Generated = append(result.Generated, info.title)
+	}
+	return nil
+}
+
+type transcriptInfo struct {
+	sidebar       bool
+	cwd, title    string
+	lastAssistant string
+	first, last   time.Time
+}
+
+// readTranscriptInfo extracts what a sidebar entry needs from a transcript.
+func readTranscriptInfo(path string) (transcriptInfo, error) {
+	var info transcriptInfo
+	f, err := os.Open(path)
+	if err != nil {
+		return info, err
+	}
+	defer func() { _ = f.Close() }()
+
+	var aiTitle, userTitle string
+	r := bufio.NewReader(f)
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			for _, ep := range sidebarEntrypoints {
+				info.sidebar = info.sidebar || bytes.Contains(line, ep)
+			}
+			var l struct {
+				Type      string `json:"type"`
+				Cwd       string `json:"cwd"`
+				Timestamp string `json:"timestamp"`
+				UUID      string `json:"uuid"`
+				AITitle   string `json:"aiTitle"`
+				Message   struct {
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &l) == nil {
+				if info.cwd == "" {
+					info.cwd = l.Cwd
+				}
+				if t, err := time.Parse(time.RFC3339Nano, l.Timestamp); err == nil {
+					if info.first.IsZero() || t.Before(info.first) {
+						info.first = t
+					}
+					if t.After(info.last) {
+						info.last = t
+					}
+				}
+				switch l.Type {
+				case "ai-title":
+					aiTitle = l.AITitle
+				case "assistant":
+					info.lastAssistant = l.UUID
+				case "user":
+					if userTitle == "" {
+						userTitle = firstRealText(l.Message.Content)
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	info.title = aiTitle
+	if info.title == "" {
+		info.title = userTitle
+	}
+	if info.title = strings.Join(strings.Fields(info.title), " "); len([]rune(info.title)) > 60 {
+		info.title = string([]rune(info.title)[:60])
+	}
+	return info, nil
+}
+
+// firstRealText returns the first text the user typed, skipping IDE/command
+// wrappers ("<...>"), interruption notices ("[...]") and skill preambles.
+func firstRealText(content json.RawMessage) string {
+	real := func(t string) bool {
+		t = strings.TrimSpace(t)
+		return t != "" && !strings.HasPrefix(t, "<") && !strings.HasPrefix(t, "[") && !strings.HasPrefix(t, "Base directory for this skill")
+	}
+	var str string
+	if json.Unmarshal(content, &str) == nil {
+		if real(str) {
+			return str
+		}
+		return ""
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(content, &blocks)
+	for _, b := range blocks {
+		if b.Type == "text" && real(b.Text) {
+			return b.Text
+		}
+	}
+	return ""
+}
+
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
 // hasTranscript reports whether ~/.claude/projects/*/<id>.jsonl exists.
