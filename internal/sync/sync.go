@@ -784,12 +784,24 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 
 type DiffEntry struct {
 	Path       string
-	Status     string // "local_only", "remote_only", "modified", "synced"
+	Status     string // see the Diff* constants
 	LocalSize  int64
 	RemoteSize int64
 	LocalTime  time.Time
 	RemoteTime time.Time
 }
+
+// Diff statuses, named by what push/pull will do with the file.
+const (
+	DiffSynced        = "synced"
+	DiffLocalNew      = "local_new"      // push uploads it
+	DiffLocalChanged  = "local_changed"  // push uploads it
+	DiffLocalDeleted  = "local_deleted"  // push deletes it from remote
+	DiffRemoteNew     = "remote_new"     // pull downloads it
+	DiffRemoteChanged = "remote_changed" // pull downloads it
+	DiffBothChanged   = "both_changed"   // pull keeps local, saves remote as .conflict
+	DiffUnknown       = "unknown"        // differs, but no sync record says which side changed
+)
 
 func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 	var entries []DiffEntry
@@ -808,65 +820,51 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 
 	remoteFiles, _ := s.buildRemoteMap(remoteObjects)
 
-	// Find local-only and modified files
 	for relPath, info := range localFiles {
-		remoteObj, exists := remoteFiles[relPath]
-		if !exists {
-			entries = append(entries, DiffEntry{
-				Path:      relPath,
-				Status:    "local_only",
-				LocalSize: info.Size(),
-				LocalTime: info.ModTime(),
-			})
-		} else {
-			stateFile := s.state.GetFile(relPath)
-			if stateFile != nil {
+		e := DiffEntry{Path: relPath, Status: DiffLocalNew, LocalSize: info.Size(), LocalTime: info.ModTime()}
+		if remoteObj, exists := remoteFiles[relPath]; exists {
+			e.RemoteSize, e.RemoteTime = remoteObj.Size, remoteObj.LastModified
+			e.Status = DiffUnknown
+			if stateFile := s.state.GetFile(relPath); stateFile != nil {
 				localHash, _ := HashFile(filepath.Join(s.claudeDir, relPath))
-				if localHash != stateFile.Hash || stateFile.RemoteChanged(remoteObj.LastModified) {
-					entries = append(entries, DiffEntry{
-						Path:       relPath,
-						Status:     "modified",
-						LocalSize:  info.Size(),
-						RemoteSize: remoteObj.Size,
-						LocalTime:  info.ModTime(),
-						RemoteTime: remoteObj.LastModified,
-					})
-				} else {
-					entries = append(entries, DiffEntry{
-						Path:       relPath,
-						Status:     "synced",
-						LocalSize:  info.Size(),
-						RemoteSize: remoteObj.Size,
-						LocalTime:  info.ModTime(),
-						RemoteTime: remoteObj.LastModified,
-					})
+				localChanged := localHash != stateFile.Hash
+				remoteChanged := stateFile.RemoteChanged(remoteObj.LastModified)
+				switch {
+				case localChanged && remoteChanged:
+					e.Status = DiffBothChanged
+				case localChanged:
+					e.Status = DiffLocalChanged
+				case remoteChanged:
+					e.Status = DiffRemoteChanged
+				default:
+					e.Status = DiffSynced
 				}
-			} else {
-				entries = append(entries, DiffEntry{
-					Path:       relPath,
-					Status:     "modified",
-					LocalSize:  info.Size(),
-					RemoteSize: remoteObj.Size,
-					LocalTime:  info.ModTime(),
-					RemoteTime: remoteObj.LastModified,
-				})
 			}
 		}
+		entries = append(entries, e)
 	}
 
-	// Find remote-only files
 	for relPath, obj := range remoteFiles {
 		if _, exists := localFiles[relPath]; !exists {
-			entries = append(entries, DiffEntry{
-				Path:       relPath,
-				Status:     "remote_only",
-				RemoteSize: obj.Size,
-				RemoteTime: obj.LastModified,
-			})
+			status := DiffRemoteNew
+			// Synced before and gone now: deleted here (push keeps delete notes)
+			if s.state.GetFile(relPath) != nil && !strings.HasSuffix(relPath, ".desktop-released.json") {
+				status = DiffLocalDeleted
+			}
+			entries = append(entries, DiffEntry{Path: relPath, Status: status, RemoteSize: obj.Size, RemoteTime: obj.LastModified})
 		}
 	}
 
 	return entries, nil
+}
+
+// ChatTitle returns the title of the chat transcript at path, or "".
+func ChatTitle(path string) string {
+	info, err := readTranscriptInfo(path)
+	if err != nil {
+		return ""
+	}
+	return info.title
 }
 
 // claudeJSONPath returns the path to ~/.claude.json, respecting test overrides.

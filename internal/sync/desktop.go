@@ -31,6 +31,7 @@ type DesktopPushResult struct {
 // DesktopPullResult describes the outcome of pulling desktop chat entries.
 type DesktopPullResult struct {
 	Added        []string // titles of chats added to the sidebar
+	Removed      []string // titles of chats removed because another device deleted them
 	Generated    []string // titles of entries built from VS Code/desktop transcripts
 	Waiting      int      // entries whose transcript hasn't been pulled yet
 	NoRemote     bool
@@ -45,6 +46,24 @@ var (
 	desktopCLIIDRe     = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 	desktopSessionIDRe = regexp.MustCompile(`^local_[A-Za-z0-9-]+$`)
 )
+
+// isDeletedChat reports whether the desktop app deleted chat id on some
+// device. Deleting a chat removes its transcript and leaves
+// projects/<dir>/<id>.desktop-released.json with reason "delete"; that note
+// syncs like any file, so every device learns of the deletion.
+func (s *Syncer) isDeletedChat(id string) bool {
+	m, _ := filepath.Glob(filepath.Join(s.claudeDir, "projects", "*", id+".desktop-released.json"))
+	for _, f := range m {
+		data, err := os.ReadFile(f)
+		var note struct {
+			Reason string `json:"reason"`
+		}
+		if err == nil && json.Unmarshal(data, &note) == nil && note.Reason == "delete" {
+			return true
+		}
+	}
+	return false
+}
 
 type desktopEntryHeader struct {
 	SessionID    string `json:"sessionId"`
@@ -155,14 +174,16 @@ func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 	for id, raw := range remote {
 		merged[id] = raw
 	}
+	result := &DesktopPushResult{Generated: generated}
 	for id, raw := range local {
 		s.state.markDesktopSeen(id)
-		// Chats started in the CLI stay out of every sidebar
-		if s.isCLIChat(id) {
-			delete(local, id)
+		// Chats started in the CLI stay out of every sidebar, and one deleted
+		// on another device stays deleted until pull removes it here
+		if s.isCLIChat(id) || s.isDeletedChat(id) {
 			continue
 		}
 		merged[id] = s.paths.NormalizeContent(desktopContentPath, raw)
+		result.Pushed++
 	}
 
 	// encoding/json sorts map keys, so equal sets marshal identically
@@ -171,7 +192,6 @@ func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize desktop entries: %w", err)
 	}
-	result := &DesktopPushResult{Pushed: len(local), Generated: generated}
 	if remote != nil && string(before) == string(data) {
 		result.Unchanged = true
 	} else {
@@ -195,8 +215,9 @@ func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 }
 
 // PullDesktop adds sidebar entries for remote desktop chats whose transcript
-// is present locally. It only creates files: existing entries are never
-// changed, and chats this device has seen before (then deleted) are skipped.
+// is present locally. Existing entries are never changed, and chats this
+// device has seen before (then deleted) are skipped. Entries for chats the app
+// deleted on another device are removed; their transcripts stay.
 func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 	dir := s.cfg.GetDesktopSessionsDir()
 	if dir == "" {
@@ -223,8 +244,19 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 
 	// No remote yet still adopts local VS Code/desktop transcripts below
 	result := &DesktopPullResult{NoRemote: remote == nil}
+	for id, raw := range local {
+		if s.isDeletedChat(id) {
+			title, err := removeDesktopEntry(dir, raw)
+			if err != nil {
+				return nil, err
+			}
+			result.Removed = append(result.Removed, title)
+			delete(local, id)
+		}
+	}
+	sort.Strings(result.Removed)
 	for _, id := range ids {
-		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) {
+		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) || s.isDeletedChat(id) {
 			continue
 		}
 		if !s.hasTranscript(id) {
@@ -345,7 +377,7 @@ func (s *Syncer) adoptTranscripts(writeDir string) (generated []string, err erro
 	sort.Strings(transcripts)
 	for _, tr := range transcripts {
 		id := strings.TrimSuffix(filepath.Base(tr), ".jsonl")
-		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) {
+		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) || s.isDeletedChat(id) {
 			continue
 		}
 		// shortcut: rereads unadopted CLI transcripts on every push/pull; cache by mtime if they get slow
@@ -502,6 +534,22 @@ func newUUID() string {
 	b[6] = b[6]&0x0f | 0x40
 	b[8] = b[8]&0x3f | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+// removeDesktopEntry deletes a local sidebar entry file, found by its
+// sessionId under dir/<account>/<org>/, and returns its title.
+func removeDesktopEntry(dir string, raw json.RawMessage) (string, error) {
+	var h desktopEntryHeader
+	if json.Unmarshal(raw, &h) != nil || !desktopSessionIDRe.MatchString(h.SessionID) {
+		return "", nil
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*", "*", h.SessionID+".json"))
+	for _, f := range files {
+		if err := os.Remove(f); err != nil {
+			return "", fmt.Errorf("failed to remove desktop entry: %w", err)
+		}
+	}
+	return h.Title, nil
 }
 
 // hasTranscript reports whether ~/.claude/projects/*/<id>.jsonl exists.

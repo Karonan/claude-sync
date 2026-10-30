@@ -752,3 +752,29 @@ func TestConflictCopiesStayLocal(t *testing.T) {
 		t.Error("Remote conflict copy was deleted by push")
 	}
 }
+
+// The desktop app can drop a delete note locally; push must keep it remote so
+// other devices still learn the chat was deleted.
+func TestPushKeepsDesktopDeleteNotes(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	const note = "projects/p/abc.desktop-released.json"
+
+	writeFile(t, env.claudeDir, note, `{"reason":"delete"}`)
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(env.claudeDir, note)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := env.syncer.Push(ctx)
+	if err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if len(result.Deleted) != 0 {
+		t.Errorf("push deleted %v", result.Deleted)
+	}
+	if _, err := env.store.Head(ctx, note+".age"); err != nil {
+		t.Error("delete note was removed from remote")
+	}
+}

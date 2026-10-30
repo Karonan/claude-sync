@@ -392,8 +392,10 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeF
 
 	for _, relPath := range knownPaths {
 		// Conflict copies synced by older versions are no longer listed locally;
-		// don't let that silently delete them from remote.
-		if IsConflictCopy(relPath) {
+		// don't let that silently delete them from remote. Desktop delete notes
+		// stay remote for good: the app can drop its local copy, and the other
+		// devices still need it to learn the chat was deleted.
+		if IsConflictCopy(relPath) || strings.HasSuffix(relPath, ".desktop-released.json") {
 			continue
 		}
 		if _, exists := localFiles[relPath]; !exists {

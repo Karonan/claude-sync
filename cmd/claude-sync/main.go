@@ -1387,50 +1387,79 @@ func diffCmd() *cobra.Command {
 				return nil
 			}
 
-			var localOnly, remoteOnly, modified, synced []sync.DiffEntry
+			groups := map[string][]sync.DiffEntry{}
 			for _, e := range entries {
-				switch e.Status {
-				case "local_only":
-					localOnly = append(localOnly, e)
-				case "remote_only":
-					remoteOnly = append(remoteOnly, e)
-				case "modified":
-					modified = append(modified, e)
-				case "synced":
-					synced = append(synced, e)
-				}
+				groups[e.Status] = append(groups[e.Status], e)
 			}
-
-			if len(localOnly) > 0 {
-				fmt.Printf("Local only (%d files):\n", len(localOnly))
-				for _, e := range localOnly {
-					fmt.Printf("  + %s (%s)\n", e.Path, util.FormatSize(e.LocalSize))
+			claudeDir := config.ClaudeDir()
+			section := func(title string, statuses ...string) {
+				var list []sync.DiffEntry
+				for _, st := range statuses {
+					list = append(list, groups[st]...)
 				}
-				fmt.Println()
-			}
-
-			if len(remoteOnly) > 0 {
-				fmt.Printf("Remote only (%d files):\n", len(remoteOnly))
-				for _, e := range remoteOnly {
-					fmt.Printf("  - %s (%s)\n", e.Path, util.FormatSize(e.RemoteSize))
+				if len(list) == 0 {
+					return
+				}
+				sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
+				fmt.Printf("%s%s (%d)%s\n", colorCyan, title, len(list), colorReset)
+				for _, e := range list {
+					tag := map[string]string{
+						sync.DiffLocalNew: "new", sync.DiffLocalChanged: "changed", sync.DiffLocalDeleted: "deleted",
+						sync.DiffRemoteNew: "new", sync.DiffRemoteChanged: "changed",
+					}[e.Status]
+					if tag != "" {
+						tag = fmt.Sprintf("%s%-8s%s", colorDim, tag, colorReset)
+					}
+					fmt.Printf("  %s%s\n", tag, diffLabel(claudeDir, e.Path))
 				}
 				fmt.Println()
 			}
 
-			if len(modified) > 0 {
-				fmt.Printf("Modified (%d files):\n", len(modified))
-				for _, e := range modified {
-					fmt.Printf("  ~ %s (local: %s, remote: %s)\n", e.Path, util.FormatSize(e.LocalSize), util.FormatSize(e.RemoteSize))
-				}
-				fmt.Println()
+			section("Push will upload from this device", sync.DiffLocalNew, sync.DiffLocalChanged)
+			section("Push will delete from the cloud (deleted on this device)", sync.DiffLocalDeleted)
+			section("Pull will download to this device", sync.DiffRemoteNew, sync.DiffRemoteChanged)
+			section("Changed on both sides: pull keeps yours and saves the cloud copy as .conflict", sync.DiffBothChanged)
+			section("Different, but no sync record says which side changed", sync.DiffUnknown)
+
+			pending := len(entries) - len(groups[sync.DiffSynced])
+			if pending == 0 {
+				fmt.Printf("%s✓%s Everything is in sync (%d files)\n", colorGreen, colorReset, len(entries))
+			} else {
+				fmt.Printf("%d files in sync, %d waiting for push or pull\n", len(groups[sync.DiffSynced]), pending)
 			}
-
-			fmt.Printf("Summary: %d synced, %d local only, %d remote only, %d modified\n",
-				len(synced), len(localOnly), len(remoteOnly), len(modified))
-
 			return nil
 		},
 	}
+}
+
+// diffLabel describes a synced path in words: chats by title and project.
+func diffLabel(claudeDir, relPath string) string {
+	parts := strings.Split(relPath, "/")
+	if len(parts) < 3 || parts[0] != "projects" {
+		return relPath
+	}
+	project := parts[1]
+	if home, err := os.UserHomeDir(); err == nil {
+		project = strings.TrimPrefix(project, sync.EncodeClaudePath(home)+"-")
+	}
+	if len(parts) > 3 { // a chat's own files, e.g. <id>/custom-title.json
+		return fmt.Sprintf("chat %s: %s  %s(%s)%s", parts[2][:min(8, len(parts[2]))], strings.Join(parts[3:], "/"), colorDim, project, colorReset)
+	}
+	name := parts[2]
+	id := name
+	if i := strings.IndexByte(id, '.'); i > 0 {
+		id = id[:i]
+	}
+	switch {
+	case strings.HasSuffix(name, ".jsonl"):
+		if title := sync.ChatTitle(filepath.Join(claudeDir, filepath.FromSlash(relPath))); title != "" {
+			return fmt.Sprintf("chat %q  %s(%s)%s", title, colorDim, project, colorReset)
+		}
+		return fmt.Sprintf("chat %s  %s(%s)%s", id[:min(8, len(id))], colorDim, project, colorReset)
+	case strings.HasSuffix(name, ".desktop-released.json"):
+		return fmt.Sprintf("note: chat %s was deleted in the desktop app  %s(%s)%s", id[:min(8, len(id))], colorDim, project, colorReset)
+	}
+	return relPath
 }
 
 type conflictFile struct {
@@ -2958,7 +2987,9 @@ func desktopCmd() *cobra.Command {
 		Long: `Sync the Claude desktop app's sidebar entries across devices, so chats
 started in the desktop app or VS Code appear in its sidebar on every device.
 CLI-only sessions are still synced (resume them with 'claude --resume') but
-stay out of the desktop sidebar. Only adds entries; never changes or removes any.
+stay out of the desktop sidebar. A chat deleted in the desktop app on one device
+leaves the sidebar on the others at their next pull; their copy of its
+transcript stays.
 
 On by default as part of every push/pull; devices without the desktop app
 skip it. Turn it off with 'desktop disable'.`,
@@ -3057,7 +3088,13 @@ func runDesktopPull(ctx context.Context, syncer *sync.Syncer) error {
 	for _, title := range append(result.Added, result.Generated...) {
 		fmt.Printf("  %s+%s %s\n", colorGreen, colorReset, title)
 	}
+	for _, title := range result.Removed {
+		fmt.Printf("  %s-%s %s\n", colorYellow, colorReset, title)
+	}
 	fmt.Printf("%s✓%s Desktop chats: %s%d added%s", colorGreen, colorReset, colorGreen, len(result.Added)+len(result.Generated), colorReset)
+	if len(result.Removed) > 0 {
+		fmt.Printf(", %d removed (deleted on another device)", len(result.Removed))
+	}
 	if len(result.Generated) > 0 {
 		fmt.Printf(" (%d from VS Code/desktop transcripts)", len(result.Generated))
 	}
@@ -3065,8 +3102,8 @@ func runDesktopPull(ctx context.Context, syncer *sync.Syncer) error {
 		fmt.Printf(", %d waiting for their transcript", result.Waiting)
 	}
 	fmt.Println()
-	if len(result.Added)+len(result.Generated) > 0 {
-		fmt.Printf("  %sRestart the Claude desktop app to see them.%s\n", colorDim, colorReset)
+	if len(result.Added)+len(result.Generated)+len(result.Removed) > 0 {
+		fmt.Printf("  %sRestart the Claude desktop app to see the changes.%s\n", colorDim, colorReset)
 	}
 	return nil
 }

@@ -316,3 +316,65 @@ func TestDesktopSyncLeavesOutCLIStartedChats(t *testing.T) {
 		t.Error("pull recreated a CLI-started chat")
 	}
 }
+
+func TestDesktopDeletionSyncsAcrossDevices(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+	for _, id := range []string{"keep", "gone", "moved"} {
+		a.addTranscript(t, id)
+	}
+	a.addEntry(t, "local_1", "keep", "/proj", "Keep me")
+	a.addEntry(t, "local_2", "gone", "/proj", "Delete me")
+	a.addEntry(t, "local_3", "moved", "/proj", "Other note")
+	if _, err := a.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The app on B deleted "gone"; its note reached A like any synced file.
+	// Notes with another reason must not remove anything.
+	note := func(id, reason string) {
+		createTestFile(t, a.claudeDir, filepath.Join("projects", "-proj", id+".desktop-released.json"),
+			`{"v":1,"releasedAt":"2026-10-30T18:11:05.410Z","reason":"`+reason+`"}`)
+	}
+	note("gone", "delete")
+	note("moved", "archive")
+
+	// Pushing before pulling must not keep the deleted chat in the remote list
+	if r, err := a.syncer.PushDesktop(ctx); err != nil || r.Pushed != 2 {
+		t.Fatalf("push: %+v %v", r, err)
+	}
+	r, err := a.syncer.PullDesktop(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Removed) != 1 || r.Removed[0] != "Delete me" {
+		t.Fatalf("pull removed %v, want [Delete me]", r.Removed)
+	}
+	got := a.entries(t)
+	if _, ok := got["gone"]; ok {
+		t.Error("deleted chat still in the sidebar")
+	}
+	if _, ok := got["keep"]; !ok {
+		t.Error("kept chat was removed")
+	}
+	if _, ok := got["moved"]; !ok {
+		t.Error("a non-delete note removed a chat")
+	}
+	if !a.syncer.hasTranscript("gone") {
+		t.Error("transcript must stay")
+	}
+	if r, _ := a.syncer.PullDesktop(ctx); len(r.Added)+len(r.Generated)+len(r.Removed) != 0 {
+		t.Errorf("second pull changed the sidebar: %+v", r)
+	}
+
+	// A device that never had it doesn't add it from an older remote list
+	b.addTranscript(t, "gone")
+	b.addTranscript(t, "keep")
+	createTestFile(t, b.claudeDir, filepath.Join("projects", "-proj", "gone.desktop-released.json"), `{"reason":"delete"}`)
+	b.addEntry(t, "local_b", "own", "/proj", "B's own chat")
+	if r, err := b.syncer.PullDesktop(ctx); err != nil || len(r.Added) != 1 || r.Added[0] != "Keep me" {
+		t.Fatalf("B pull: %+v %v", r, err)
+	}
+}
