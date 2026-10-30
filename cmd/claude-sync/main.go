@@ -1121,7 +1121,7 @@ func pushCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
-	cmd.Flags().BoolVar(&includeDesktop, "include-desktop", false, "Also sync the Claude desktop app's chat list")
+	cmd.Flags().BoolVar(&includeDesktop, "include-desktop", false, "Sync the desktop app's chat list even if 'desktop disable' turned it off")
 	return cmd
 }
 
@@ -1276,7 +1276,7 @@ Examples:
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing files without confirmation")
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
-	cmd.Flags().BoolVar(&includeDesktop, "include-desktop", false, "Also sync the Claude desktop app's chat list")
+	cmd.Flags().BoolVar(&includeDesktop, "include-desktop", false, "Sync the desktop app's chat list even if 'desktop disable' turned it off")
 	cmd.Flags().BoolVar(&rebuildHistory, "rebuild-history", false, "Rebuild ~/.claude/history.jsonl from session files after pulling")
 
 	return cmd
@@ -2953,9 +2953,12 @@ func desktopCmd() *cobra.Command {
 		Use:   "desktop",
 		Short: "Manage Claude desktop app chat list sync",
 		Long: `Sync the Claude desktop app's sidebar entries across devices, so chats
-started in the desktop app appear in its sidebar on other devices. CLI-only
-sessions are still synced (resume them with 'claude --resume') but stay out of
-the desktop sidebar. Pull only adds entries; it never changes or removes any.`,
+started in the desktop app or VS Code appear in its sidebar on every device.
+CLI-only sessions are still synced (resume them with 'claude --resume') but
+stay out of the desktop sidebar. Only adds entries; never changes or removes any.
+
+On by default as part of every push/pull; devices without the desktop app
+skip it. Turn it off with 'desktop disable'.`,
 	}
 	setDesktop := func(enabled bool) *cobra.Command {
 		use, short := "disable", "Stop including desktop chats in every push/pull"

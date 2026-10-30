@@ -519,6 +519,17 @@ func TestGetEffectiveSyncPathsAppliedByFullScope(t *testing.T) {
 	}
 }
 
+func TestIsDesktopSyncEnabledDefaultsOn(t *testing.T) {
+	for _, tt := range []struct {
+		v    *bool
+		want bool
+	}{{nil, true}, {boolPtr(true), true}, {boolPtr(false), false}} {
+		if got := (&Config{DesktopSync: tt.v}).IsDesktopSyncEnabled(); got != tt.want {
+			t.Errorf("IsDesktopSyncEnabled(%v) = %v, want %v", tt.v, got, tt.want)
+		}
+	}
+}
+
 func TestIsMCPSyncEnabled(t *testing.T) {
 	tests := []struct {
 		name    string

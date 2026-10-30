@@ -64,9 +64,10 @@ type Config struct {
 	// compatibility with existing configs.
 	MCPSync *bool `yaml:"mcp_sync,omitempty"`
 
-	// DesktopSync enables syncing the Claude desktop app's chat list, so chats
-	// started in the desktop app show up in its sidebar on other devices while
-	// CLI-only sessions stay out of it. Nil is treated as disabled.
+	// DesktopSync controls syncing the Claude desktop app's chat list, so
+	// desktop and VS Code chats show up in its sidebar on every device while
+	// CLI-only sessions stay out of it. Nil is treated as enabled; devices
+	// without the desktop app skip it.
 	DesktopSync *bool `yaml:"desktop_sync,omitempty"`
 
 	// DesktopSessionsDir overrides auto-detection of the desktop app's
@@ -331,9 +332,9 @@ func (c *Config) SetMCPSync(enabled bool) {
 	c.MCPSync = &enabled
 }
 
-// IsDesktopSyncEnabled returns true if desktop chat sync is explicitly enabled.
+// IsDesktopSyncEnabled returns true unless desktop chat sync is explicitly disabled.
 func (c *Config) IsDesktopSyncEnabled() bool {
-	return c.DesktopSync != nil && *c.DesktopSync
+	return c.DesktopSync == nil || *c.DesktopSync
 }
 
 // GetDesktopSessionsDir returns the configured desktop sessions directory, or
