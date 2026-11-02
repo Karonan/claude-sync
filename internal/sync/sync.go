@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -325,7 +326,9 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 		shouldDownload := false
 
 		if !localExists {
-			shouldDownload = true
+			// A chat deleted in the desktop app stays deleted; push removes it from remote.
+			// (One whose note arrives in this same pull is removed by removeDeletedChats.)
+			shouldDownload = !s.isDeletedChatFile(localPath)
 		} else if stateFile != nil {
 			// Check if remote changed since the version we last synced
 			if stateFile.RemoteChanged(remoteObj.LastModified) {
@@ -413,6 +416,8 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	}
 
 	s.progress(ProgressEvent{Action: "download", Complete: true, Total: total})
+
+	result.Deleted = s.removeDeletedChats()
 
 	s.state.LastPull = time.Now()
 	s.state.LastSync = time.Now()
@@ -739,6 +744,9 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 		}
 
 		if !localExists {
+			if s.isDeletedChatFile(localPath) {
+				continue // pull leaves deleted chats deleted
+			}
 			// New file from remote
 			fp.RemoteOnly = true
 			preview.WouldDownload = append(preview.WouldDownload, fp)
@@ -785,6 +793,7 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 type DiffEntry struct {
 	Path       string
 	Status     string // see the Diff* constants
+	Title      string // name of the chat the path belongs to, "" if unknown
 	LocalSize  int64
 	RemoteSize int64
 	LocalTime  time.Time
@@ -796,7 +805,8 @@ const (
 	DiffSynced        = "synced"
 	DiffLocalNew      = "local_new"      // push uploads it
 	DiffLocalChanged  = "local_changed"  // push uploads it
-	DiffLocalDeleted  = "local_deleted"  // push deletes it from remote
+	DiffLocalDeleted  = "local_deleted"  // push deletes it from remote; pull restores it
+	DiffChatDeleted   = "chat_deleted"   // deleted in the desktop app: push deletes it from remote, pull leaves it
 	DiffRemoteNew     = "remote_new"     // pull downloads it
 	DiffRemoteChanged = "remote_changed" // pull downloads it
 	DiffBothChanged   = "both_changed"   // pull keeps local, saves remote as .conflict
@@ -847,24 +857,113 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 	for relPath, obj := range remoteFiles {
 		if _, exists := localFiles[relPath]; !exists {
 			status := DiffRemoteNew
+			synced := s.state.GetFile(relPath) != nil
+			switch {
+			case s.isDeletedChatFile(relPath):
+				if !synced {
+					continue // never here, and pull won't fetch it: nothing to do
+				}
+				status = DiffChatDeleted
 			// Synced before and gone now: deleted here (push keeps delete notes)
-			if s.state.GetFile(relPath) != nil && !strings.HasSuffix(relPath, ".desktop-released.json") {
+			case synced && !strings.HasSuffix(relPath, ".desktop-released.json"):
 				status = DiffLocalDeleted
 			}
 			entries = append(entries, DiffEntry{Path: relPath, Status: status, RemoteSize: obj.Size, RemoteTime: obj.LastModified})
 		}
 	}
 
+	s.nameChats(ctx, entries, remoteFiles)
 	return entries, nil
 }
 
-// ChatTitle returns the title of the chat transcript at path, or "".
-func ChatTitle(path string) string {
-	info, err := readTranscriptInfo(path)
-	if err != nil {
-		return ""
+// maxRemoteTitles caps how many transcripts one diff downloads just to read
+// chat names.
+// shortcut: chats past the cap show their id; cache titles in state if that bites.
+const maxRemoteTitles = 50
+
+var chatIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// ChatID returns the project folder and chat id that relPath belongs to: the
+// chat's transcript, a file in its folder, or its delete note.
+func ChatID(relPath string) (project, id string, ok bool) {
+	parts := strings.Split(relPath, "/")
+	if len(parts) < 3 || parts[0] != "projects" {
+		return "", "", false
 	}
-	return info.title
+	id = parts[2]
+	if len(parts) == 3 {
+		id, _, _ = strings.Cut(id, ".")
+	}
+	return parts[1], id, chatIDRe.MatchString(id)
+}
+
+// nameChats sets Title on pending entries that belong to a chat: the name it
+// was renamed to (custom-title.json), else the transcript's title. Each is read
+// locally, else from the remote copy: a deleted chat's files stay there until
+// push removes them.
+func (s *Syncer) nameChats(ctx context.Context, entries []DiffEntry, remoteFiles map[string]storage.ObjectInfo) {
+	titles := map[string]string{} // "project/id" -> title
+	fetch := map[string]string{}  // "project/id" -> remote path to read the title from
+	for _, e := range entries {
+		project, id, ok := ChatID(e.Path)
+		if !ok || e.Status == DiffSynced {
+			continue
+		}
+		k := project + "/" + id
+		if _, seen := titles[k]; seen {
+			continue
+		}
+		titles[k] = ""
+		custom := "projects/" + k + "/custom-title.json"
+		transcript := "projects/" + k + ".jsonl"
+		if data, err := os.ReadFile(filepath.Join(s.claudeDir, filepath.FromSlash(custom))); err == nil && customTitle(data) != "" {
+			titles[k] = customTitle(data)
+		} else if _, ok := remoteFiles[custom]; ok {
+			fetch[k] = custom
+		} else if info, err := readTranscriptInfo(filepath.Join(s.claudeDir, filepath.FromSlash(transcript))); err == nil {
+			titles[k] = info.title
+		} else if _, ok := remoteFiles[transcript]; ok && len(fetch) < maxRemoteTitles {
+			fetch[k] = transcript
+		}
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, defaultWorkers)
+	for k, path := range fetch {
+		wg.Add(1)
+		go func(k, path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			data, err := s.decryptRemote(ctx, remoteFiles[path].Key)
+			if err != nil {
+				return // name stays unknown; diff still works
+			}
+			title := customTitle(data)
+			if strings.HasSuffix(path, ".jsonl") {
+				title = parseTranscriptInfo(bytes.NewReader(data)).title
+			}
+			mu.Lock()
+			titles[k] = title
+			mu.Unlock()
+		}(k, path)
+	}
+	wg.Wait()
+
+	for i := range entries {
+		if project, id, ok := ChatID(entries[i].Path); ok {
+			entries[i].Title = titles[project+"/"+id]
+		}
+	}
+}
+
+func customTitle(data []byte) string {
+	var c struct {
+		CustomTitle string `json:"customTitle"`
+	}
+	_ = json.Unmarshal(data, &c)
+	return c.CustomTitle
 }
 
 // claudeJSONPath returns the path to ~/.claude.json, respecting test overrides.

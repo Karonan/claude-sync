@@ -375,7 +375,12 @@ func DesktopSessionsDirPath() string {
 	return ""
 }
 
-// IsExcluded returns true if the given relative path matches any exclude pattern.
+// DefaultExcludes are never synced, whatever the config says. Plugin catalogs
+// are re-downloaded by Claude Code from plugins/known_marketplaces.json, and
+// each refresh rewrites hundreds of files.
+var DefaultExcludes = []string{"plugins/marketplaces/**"}
+
+// IsExcluded returns true if the given relative path matches DefaultExcludes or any exclude pattern.
 // Patterns support:
 //   - Full doublestar glob syntax including ** for recursive matching
 //   - Examples: "**/.git/**", "*.tmp", "plugins/cache/**", "projects/*/node_modules/**"
@@ -385,7 +390,7 @@ func (c *Config) IsExcluded(relPath string) bool {
 	// Normalize path separators for consistent matching
 	relPath = filepath.ToSlash(relPath)
 
-	for _, pattern := range c.Exclude {
+	for _, pattern := range append(append([]string{}, DefaultExcludes...), c.Exclude...) {
 		// Normalize pattern separators
 		pattern = filepath.ToSlash(pattern)
 

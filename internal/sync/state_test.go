@@ -618,3 +618,14 @@ func TestGetLocalFilesSkipsSymlinksInDirectories(t *testing.T) {
 		t.Error("Symlink in subdir should be skipped during directory walk")
 	}
 }
+
+func TestRemoteChangedIgnoresSubSecondPrecision(t *testing.T) {
+	// Recorded from Head (whole seconds); listed by List (milliseconds) for the same upload.
+	f := &FileState{RemoteModTime: time.Date(2026, 10, 30, 17, 45, 14, 0, time.UTC)}
+	if f.RemoteChanged(time.Date(2026, 10, 30, 17, 45, 14, 863e6, time.UTC)) {
+		t.Error("same upload seen with milliseconds should not count as a remote change")
+	}
+	if !f.RemoteChanged(time.Date(2026, 10, 30, 17, 45, 15, 0, time.UTC)) {
+		t.Error("a later upload should count as a remote change")
+	}
+}

@@ -1212,13 +1212,16 @@ Examples:
 			if !quiet {
 				fmt.Println() // Clear the progress line
 
-				if len(result.Downloaded) == 0 && len(result.Conflicts) == 0 && len(result.Errors) == 0 {
+				if len(result.Downloaded) == 0 && len(result.Deleted) == 0 && len(result.Conflicts) == 0 && len(result.Errors) == 0 {
 					// Already printed "Already up to date"
 				} else {
 					// Summary
 					var parts []string
 					if len(result.Downloaded) > 0 {
 						parts = append(parts, fmt.Sprintf("%s%d downloaded%s", colorGreen, len(result.Downloaded), colorReset))
+					}
+					if len(result.Deleted) > 0 {
+						parts = append(parts, fmt.Sprintf("%s%d files of deleted chats removed%s", colorGreen, len(result.Deleted), colorReset))
 					}
 					if len(result.Conflicts) > 0 {
 						parts = append(parts, fmt.Sprintf("%s%d conflicts%s", colorYellow, len(result.Conflicts), colorReset))
@@ -1391,7 +1394,6 @@ func diffCmd() *cobra.Command {
 			for _, e := range entries {
 				groups[e.Status] = append(groups[e.Status], e)
 			}
-			claudeDir := config.ClaudeDir()
 			section := func(title string, statuses ...string) {
 				var list []sync.DiffEntry
 				for _, st := range statuses {
@@ -1404,19 +1406,20 @@ func diffCmd() *cobra.Command {
 				fmt.Printf("%s%s (%d)%s\n", colorCyan, title, len(list), colorReset)
 				for _, e := range list {
 					tag := map[string]string{
-						sync.DiffLocalNew: "new", sync.DiffLocalChanged: "changed", sync.DiffLocalDeleted: "deleted",
+						sync.DiffLocalNew: "new", sync.DiffLocalChanged: "changed", sync.DiffLocalDeleted: "deleted", sync.DiffChatDeleted: "deleted",
 						sync.DiffRemoteNew: "new", sync.DiffRemoteChanged: "changed",
 					}[e.Status]
 					if tag != "" {
 						tag = fmt.Sprintf("%s%-8s%s", colorDim, tag, colorReset)
 					}
-					fmt.Printf("  %s%s\n", tag, diffLabel(claudeDir, e.Path))
+					fmt.Printf("  %s%s\n", tag, diffLabel(e))
 				}
 				fmt.Println()
 			}
 
 			section("Push will upload from this device", sync.DiffLocalNew, sync.DiffLocalChanged)
-			section("Push will delete from the cloud (deleted on this device)", sync.DiffLocalDeleted)
+			section("Push will delete from the cloud (chat deleted in the desktop app)", sync.DiffChatDeleted)
+			section("Deleted on this device: push deletes it from the cloud, pull brings it back", sync.DiffLocalDeleted)
 			section("Pull will download to this device", sync.DiffRemoteNew, sync.DiffRemoteChanged)
 			section("Changed on both sides: pull keeps yours and saves the cloud copy as .conflict", sync.DiffBothChanged)
 			section("Different, but no sync record says which side changed", sync.DiffUnknown)
@@ -1432,34 +1435,30 @@ func diffCmd() *cobra.Command {
 	}
 }
 
-// diffLabel describes a synced path in words: chats by title and project.
-func diffLabel(claudeDir, relPath string) string {
-	parts := strings.Split(relPath, "/")
-	if len(parts) < 3 || parts[0] != "projects" {
-		return relPath
+// diffLabel describes a synced path in words: chats by name and project.
+func diffLabel(e sync.DiffEntry) string {
+	project, id, ok := sync.ChatID(e.Path)
+	if !ok {
+		return e.Path
 	}
-	project := parts[1]
 	if home, err := os.UserHomeDir(); err == nil {
 		project = strings.TrimPrefix(project, sync.EncodeClaudePath(home)+"-")
 	}
-	if len(parts) > 3 { // a chat's own files, e.g. <id>/custom-title.json
-		return fmt.Sprintf("chat %s: %s  %s(%s)%s", parts[2][:min(8, len(parts[2]))], strings.Join(parts[3:], "/"), colorDim, project, colorReset)
+	chat := fmt.Sprintf("chat %s (name unknown)", id[:8])
+	if e.Title != "" {
+		chat = fmt.Sprintf("chat %q", e.Title)
 	}
-	name := parts[2]
-	id := name
-	if i := strings.IndexByte(id, '.'); i > 0 {
-		id = id[:i]
-	}
+	where := fmt.Sprintf("  %s(%s)%s", colorDim, project, colorReset)
+	parts := strings.Split(e.Path, "/")
 	switch {
-	case strings.HasSuffix(name, ".jsonl"):
-		if title := sync.ChatTitle(filepath.Join(claudeDir, filepath.FromSlash(relPath))); title != "" {
-			return fmt.Sprintf("chat %q  %s(%s)%s", title, colorDim, project, colorReset)
-		}
-		return fmt.Sprintf("chat %s  %s(%s)%s", id[:min(8, len(id))], colorDim, project, colorReset)
-	case strings.HasSuffix(name, ".desktop-released.json"):
-		return fmt.Sprintf("note: chat %s was deleted in the desktop app  %s(%s)%s", id[:min(8, len(id))], colorDim, project, colorReset)
+	case len(parts) > 3: // a chat's own files, e.g. <id>/custom-title.json
+		return fmt.Sprintf("%s: %s%s", chat, strings.Join(parts[3:], "/"), where)
+	case strings.HasSuffix(e.Path, ".jsonl"):
+		return chat + where
+	case strings.HasSuffix(e.Path, ".desktop-released.json"):
+		return fmt.Sprintf("note: %s was deleted in the desktop app%s", chat, where)
 	}
-	return relPath
+	return e.Path
 }
 
 type conflictFile struct {
@@ -2597,12 +2596,15 @@ func executePull(ctx context.Context, syncer *sync.Syncer) error {
 	if !quiet {
 		fmt.Println()
 
-		if len(result.Downloaded) == 0 && len(result.Conflicts) == 0 && len(result.Errors) == 0 {
+		if len(result.Downloaded) == 0 && len(result.Deleted) == 0 && len(result.Conflicts) == 0 && len(result.Errors) == 0 {
 			// Already printed "Already up to date"
 		} else {
 			var parts []string
 			if len(result.Downloaded) > 0 {
 				parts = append(parts, fmt.Sprintf("%s%d downloaded%s", colorGreen, len(result.Downloaded), colorReset))
+			}
+			if len(result.Deleted) > 0 {
+				parts = append(parts, fmt.Sprintf("%s%d files of deleted chats removed%s", colorGreen, len(result.Deleted), colorReset))
 			}
 			if len(result.Conflicts) > 0 {
 				parts = append(parts, fmt.Sprintf("%s%d conflicts%s", colorYellow, len(result.Conflicts), colorReset))
@@ -3408,11 +3410,12 @@ func runPathsList() error {
 			config.ScopeFull)
 	}
 
-	if len(status.Excludes) > 0 {
-		fmt.Printf("\n%sExclude Filters%s:\n", colorBold, colorReset)
-		for _, e := range status.Excludes {
-			fmt.Printf("  %s-%s %s\n", colorYellow, colorReset, e)
-		}
+	fmt.Printf("\n%sExclude Filters%s:\n", colorBold, colorReset)
+	for _, e := range config.DefaultExcludes {
+		fmt.Printf("  %s-%s %s %s(built in)%s\n", colorYellow, colorReset, e, colorDim, colorReset)
+	}
+	for _, e := range status.Excludes {
+		fmt.Printf("  %s-%s %s\n", colorYellow, colorReset, e)
 	}
 
 	fmt.Println()

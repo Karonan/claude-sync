@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,15 +56,80 @@ var (
 func (s *Syncer) isDeletedChat(id string) bool {
 	m, _ := filepath.Glob(filepath.Join(s.claudeDir, "projects", "*", id+".desktop-released.json"))
 	for _, f := range m {
-		data, err := os.ReadFile(f)
-		var note struct {
-			Reason string `json:"reason"`
-		}
-		if err == nil && json.Unmarshal(data, &note) == nil && note.Reason == "delete" {
+		if isDeleteNote(f) {
 			return true
 		}
 	}
 	return false
+}
+
+func isDeleteNote(path string) bool {
+	data, err := os.ReadFile(path)
+	var note struct {
+		Reason string `json:"reason"`
+	}
+	return err == nil && json.Unmarshal(data, &note) == nil && note.Reason == "delete"
+}
+
+// removeDeletedChats deletes this device's copy of chats deleted in the
+// desktop app: the transcript and the chat's folder. A file changed here since
+// the last sync is kept, so nothing written only on this device is lost. State
+// entries stay, so push still clears any copy left in remote.
+func (s *Syncer) removeDeletedChats() []string {
+	notes, _ := filepath.Glob(filepath.Join(s.claudeDir, "projects", "*", "*.desktop-released.json"))
+	var removed []string
+	for _, note := range notes {
+		id := strings.TrimSuffix(filepath.Base(note), ".desktop-released.json")
+		if !desktopCLIIDRe.MatchString(id) || !isDeleteNote(note) {
+			continue
+		}
+		chatDir := strings.TrimSuffix(note, ".desktop-released.json")
+		files := []string{chatDir + ".jsonl"}
+		var dirs []string
+		_ = filepath.WalkDir(chatDir, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				dirs = append(dirs, p)
+			} else if err == nil {
+				files = append(files, p)
+			}
+			return nil
+		})
+		for _, f := range files {
+			rel, _ := filepath.Rel(s.claudeDir, f)
+			rel = filepath.ToSlash(rel)
+			st := s.state.GetFile(rel)
+			if st == nil {
+				continue
+			}
+			if h, err := HashFile(f); err != nil || h != st.Hash {
+				continue
+			}
+			if os.Remove(f) == nil {
+				removed = append(removed, rel)
+			}
+		}
+		for i := len(dirs) - 1; i >= 0; i-- {
+			_ = os.Remove(dirs[i]) // only succeeds once empty
+		}
+	}
+	return removed
+}
+
+// isDeletedChatFile reports whether relPath is the transcript, or a file in the
+// folder, of a chat deleted in the desktop app (not its delete note).
+func (s *Syncer) isDeletedChatFile(relPath string) bool {
+	parts := strings.Split(relPath, "/")
+	if len(parts) < 3 || parts[0] != "projects" {
+		return false
+	}
+	id := parts[2]
+	if len(parts) == 3 {
+		if !strings.HasSuffix(id, ".jsonl") {
+			return false
+		}
+		id = strings.TrimSuffix(id, ".jsonl")
+	}
+	return desktopCLIIDRe.MatchString(id) && s.isDeletedChat(id)
 }
 
 type desktopEntryHeader struct {
@@ -441,10 +508,14 @@ func readTranscriptInfo(path string) (transcriptInfo, error) {
 		return info, err
 	}
 	defer func() { _ = f.Close() }()
+	return parseTranscriptInfo(f), nil
+}
 
+func parseTranscriptInfo(src io.Reader) transcriptInfo {
+	var info transcriptInfo
 	var aiTitle, userTitle string
 	var seenEntrypoint bool
-	r := bufio.NewReader(f)
+	r := bufio.NewReader(src)
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
@@ -498,7 +569,7 @@ func readTranscriptInfo(path string) (transcriptInfo, error) {
 	if info.title = strings.Join(strings.Fields(info.title), " "); len([]rune(info.title)) > 60 {
 		info.title = string([]rune(info.title)[:60])
 	}
-	return info, nil
+	return info
 }
 
 // firstRealText returns the first text the user typed, skipping IDE/command

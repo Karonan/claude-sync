@@ -19,6 +19,7 @@ import (
 type mockStorage struct {
 	mu      sync.Mutex
 	objects map[string]mockObject
+	clock   time.Time
 }
 
 type mockObject struct {
@@ -35,7 +36,13 @@ func (m *mockStorage) Upload(_ context.Context, key string, data []byte) error {
 	defer m.mu.Unlock()
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	m.objects[key] = mockObject{data: cp, lastModified: time.Now()}
+	// Like R2's Head, distinguish uploads only to the second: each upload lands a second later.
+	if now := time.Now(); now.After(m.clock.Add(time.Second)) {
+		m.clock = now
+	} else {
+		m.clock = m.clock.Add(time.Second)
+	}
+	m.objects[key] = mockObject{data: cp, lastModified: m.clock}
 	return nil
 }
 
@@ -776,5 +783,154 @@ func TestPushKeepsDesktopDeleteNotes(t *testing.T) {
 	}
 	if _, err := env.store.Head(ctx, note+".age"); err != nil {
 		t.Error("delete note was removed from remote")
+	}
+}
+
+// A chat deleted in the desktop app must not come back on pull; push removes
+// it from remote. Other deleted files are still restored by pull.
+func TestPullLeavesDeletedChatDeleted(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	const chat = "projects/p/abc.jsonl"
+	const title = "projects/p/abc/custom-title.json"
+	const other = "projects/p/notes.md"
+
+	writeFile(t, env.claudeDir, chat, `{"type":"user"}`+"\n")
+	writeFile(t, env.claudeDir, title, `{}`)
+	writeFile(t, env.claudeDir, other, "x")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	for _, p := range []string{chat, title, other} {
+		if err := os.Remove(filepath.Join(env.claudeDir, p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, env.claudeDir, "projects/p/abc.desktop-released.json", `{"reason":"delete"}`)
+
+	entries, err := env.syncer.Diff(ctx)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+	want := map[string]string{chat: DiffChatDeleted, title: DiffChatDeleted, other: DiffLocalDeleted}
+	for _, e := range entries {
+		if w, ok := want[e.Path]; ok && e.Status != w {
+			t.Errorf("diff %s = %s, want %s", e.Path, e.Status, w)
+		}
+	}
+
+	if _, err := env.syncer.Pull(ctx); err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	for _, p := range []string{chat, title} {
+		if _, err := os.Stat(filepath.Join(env.claudeDir, p)); err == nil {
+			t.Errorf("pull restored deleted chat file %s", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.claudeDir, other)); err != nil {
+		t.Errorf("pull should still restore other deleted files: %v", err)
+	}
+
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if _, err := env.store.Head(ctx, chat+".age"); err == nil {
+		t.Error("push left the deleted chat in remote")
+	}
+}
+
+// When another device deletes a chat, pull removes this device's copy too,
+// except files changed here since the last sync.
+func TestPullRemovesChatDeletedElsewhere(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	const chat = "projects/p/abc.jsonl"
+	const sub = "projects/p/abc/subagents/a.jsonl"
+	const edited = "projects/p/abc/custom-title.json"
+	const note = "projects/p/abc.desktop-released.json"
+
+	writeFile(t, env.claudeDir, chat, `{"type":"user"}`+"\n")
+	writeFile(t, env.claudeDir, sub, "{}\n")
+	writeFile(t, env.claudeDir, edited, `{}`)
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	writeFile(t, env.claudeDir, edited, `{"title":"renamed here"}`)
+
+	// The other device deletes the chat and pushes its delete note
+	encrypted, _ := env.syncer.encryptor.Encrypt([]byte(`{"reason":"delete"}`))
+	if err := env.store.Upload(ctx, env.syncer.remoteKey(note), encrypted); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := env.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	if len(result.Deleted) != 2 {
+		t.Errorf("Deleted = %v, want the transcript and subagent file", result.Deleted)
+	}
+	for _, p := range []string{chat, sub} {
+		if _, err := os.Stat(filepath.Join(env.claudeDir, p)); err == nil {
+			t.Errorf("pull kept %s of a deleted chat", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.claudeDir, "projects/p/abc/subagents")); err == nil {
+		t.Error("empty folder of deleted chat left behind")
+	}
+	if got := readFile(t, env.claudeDir, edited); got != `{"title":"renamed here"}` {
+		t.Errorf("file changed on this device was removed or altered: %q", got)
+	}
+}
+
+// diff names chats by title, reading a deleted chat's name from its remote copy.
+func TestDiffNamesDeletedChatsFromRemote(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	const id = "0b5e4c1a-1111-4222-8333-944455556666"
+	chat := "projects/p/" + id + ".jsonl"
+
+	writeFile(t, env.claudeDir, chat, `{"type":"user","message":{"content":"Plan the dragon fight"}}`+"\n")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(env.claudeDir, chat)); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, env.claudeDir, "projects/p/"+id+".desktop-released.json", `{"reason":"delete"}`)
+
+	entries, err := env.syncer.Diff(ctx)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+	named := 0
+	for _, e := range entries {
+		if _, got, ok := ChatID(e.Path); ok && got == id {
+			if e.Title != "Plan the dragon fight" {
+				t.Errorf("%s: Title = %q", e.Path, e.Title)
+			}
+			named++
+		}
+	}
+	if named != 2 {
+		t.Errorf("expected the transcript and its note to be named, got %d entries", named)
+	}
+}
+
+func TestDiffPrefersRenamedChatTitle(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	const id = "1c2d3e4f-1111-4222-8333-944455556666"
+
+	writeFile(t, env.claudeDir, "projects/p/"+id+".jsonl", `{"type":"user","message":{"content":"first message"}}`+"\n")
+	writeFile(t, env.claudeDir, "projects/p/"+id+"/custom-title.json", `{"customTitle":"Renamed chat"}`)
+	entries, err := env.syncer.Diff(ctx)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+	for _, e := range entries {
+		if _, got, ok := ChatID(e.Path); ok && got == id && e.Title != "Renamed chat" {
+			t.Errorf("%s: Title = %q, want the renamed title", e.Path, e.Title)
+		}
 	}
 }

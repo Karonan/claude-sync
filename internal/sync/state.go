@@ -31,7 +31,8 @@ type FileState struct {
 // device last synced.
 func (f *FileState) RemoteChanged(remoteModTime time.Time) bool {
 	if !f.RemoteModTime.IsZero() {
-		return remoteModTime.After(f.RemoteModTime)
+		// Head reports whole seconds, List reports milliseconds: compare at Head's precision.
+		return remoteModTime.Truncate(time.Second).After(f.RemoteModTime.Truncate(time.Second))
 	}
 	// State written before RemoteModTime existed: fall back to this device's clock.
 	return remoteModTime.After(f.Uploaded)
