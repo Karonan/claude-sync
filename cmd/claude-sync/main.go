@@ -2990,8 +2990,8 @@ func desktopCmd() *cobra.Command {
 started in the desktop app or VS Code appear in its sidebar on every device.
 CLI-only sessions are still synced (resume them with 'claude --resume') but
 stay out of the desktop sidebar. A chat deleted in the desktop app on one device
-leaves the sidebar on the others at their next pull; their copy of its
-transcript stays.
+leaves the sidebar on the others at their next pull, and their copy of its
+files is removed (files changed on that device since its last sync are kept).
 
 On by default as part of every push/pull; devices without the desktop app
 skip it. Turn it off with 'desktop disable'.`,
