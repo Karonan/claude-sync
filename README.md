@@ -36,6 +36,8 @@
 
 ## Quick Start
 
+> Using this fork? Install it with [This fork (build from source)](#this-fork-build-from-source) instead of npm.
+
 ### First Device
 
 ```bash
@@ -426,6 +428,30 @@ Claude sessions typically use < 50MB. Syncing is effectively **free** on any pro
 | **WebDAV** | Self-hosted — no limits, no cost beyond your own server |
 
 ## Installation Options
+
+### This fork (build from source)
+
+The npm packages, release binaries, `go install …@latest` and `claude-sync update` all install the original [tawanorg/claude-sync](https://github.com/tawanorg/claude-sync), without this fork's changes. To use this fork, build it.
+
+**Prerequisite:** Go 1.24+, with Go's bin folder (`go env GOPATH`/bin) on your PATH
+
+Install:
+
+```bash
+git clone https://github.com/Karonan/claude-sync
+cd claude-sync
+go install -ldflags "-X main.version=dev" ./cmd/claude-sync
+claude-sync --version   # claude-sync version dev
+```
+
+Update (run in the `claude-sync` folder):
+
+```bash
+git pull
+go install -ldflags "-X main.version=dev" ./cmd/claude-sync
+```
+
+Don't run `claude-sync update`: it replaces this build with the original version. Update every device, so they all run the same version.
 
 ### npm (recommended)
 
