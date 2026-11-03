@@ -197,6 +197,24 @@ func (s *SyncState) GetFile(relativePath string) *FileState {
 	return s.Files[relativePath]
 }
 
+// CanonicalizePaths re-keys entries recorded under another spelling of the
+// same path. When both spellings exist, the canonical entry is kept.
+func (s *SyncState) CanonicalizePaths(canonical func(string) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for p, f := range s.Files {
+		c := canonical(p)
+		if c == p {
+			continue
+		}
+		delete(s.Files, p)
+		if _, ok := s.Files[c]; !ok {
+			f.Path = c
+			s.Files[c] = f
+		}
+	}
+}
+
 func (s *SyncState) RemoveFile(relativePath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,12 +366,16 @@ type FileChange struct {
 }
 
 func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeFn ...func(string) bool) ([]FileChange, error) {
-	var changes []FileChange
-
 	localFiles, err := GetLocalFiles(claudeDir, syncPaths, excludeFn...)
 	if err != nil {
 		return nil, err
 	}
+	return s.changesIn(claudeDir, localFiles)
+}
+
+// changesIn compares localFiles (as GetLocalFiles returns them) with the state.
+func (s *SyncState) changesIn(claudeDir string, localFiles map[string]os.FileInfo) ([]FileChange, error) {
+	var changes []FileChange
 
 	// Check for new or modified files
 	for relPath, info := range localFiles {

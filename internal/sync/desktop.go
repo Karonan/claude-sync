@@ -96,7 +96,7 @@ func (s *Syncer) removeDeletedChats() []string {
 		})
 		for _, f := range files {
 			rel, _ := filepath.Rel(s.claudeDir, f)
-			rel = filepath.ToSlash(rel)
+			rel = s.paths.CanonicalRelPath(filepath.ToSlash(rel))
 			st := s.state.GetFile(rel)
 			if st == nil {
 				continue

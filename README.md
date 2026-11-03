@@ -213,7 +213,10 @@ Also synced, outside `~/.claude/`:
 
 Never synced:
 
-- `plugins/marketplaces/` (built in): plugin catalogs. Claude Code downloads them itself from the sources in `plugins/known_marketplaces.json`, and each refresh rewrites hundreds of files. Installed plugins (`settings.json`, `plugins/installed_plugins.json`, `plugins/cache/`) still sync.
+- `plugins/marketplaces/` (built in): plugin catalogs. Claude Code downloads them itself from the sources in `plugins/known_marketplaces.json`, and each refresh rewrites hundreds of files.
+- `plugins/synced/` (built in): plugins from your claude.ai account, which the Claude app downloads and updates on each device itself.
+
+Installed plugins (`settings.json`, `plugins/installed_plugins.json`, `plugins/cache/`) still sync.
 - `.conflict.<timestamp>` copies: they stay on the device that made them.
 - Symlinks inside `~/.claude/`.
 - Anything matching your own [exclude filters](#choosing-what-syncs).
@@ -297,7 +300,7 @@ claude-sync keeps a record of every file it synced (`~/.claude-sync/state.json`)
 **Pull** downloads files that are new or changed in the cloud:
 
 - A file that changed only in the cloud replaces your copy.
-- A file that changed on both sides is a **conflict**: your copy is kept and the cloud copy is saved next to it as `<file>.conflict.<timestamp>` (see [Conflict Resolution](#conflict-resolution)).
+- A file that changed on both sides is a **conflict**: your copy is kept and the cloud copy is saved next to it as `<file>.conflict.<timestamp>` (see [Conflict Resolution](#conflict-resolution)). Chats are checked first: they only grow, so if one side already has every message of the other, pull keeps that side and there is no conflict. A chat only conflicts when you continued it on two devices without syncing in between. The session-duration and cost line Claude Code rewrites on its own is ignored.
 - A file you deleted here but haven't pushed yet is downloaded again. Push first if you want the deletion to stick. Desktop app chats are the exception, see below.
 
 Whether the cloud copy changed is decided from the cloud's own timestamps, so a device whose clock is off doesn't cause false conflicts.

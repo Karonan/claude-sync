@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -932,5 +933,116 @@ func TestDiffPrefersRenamedChatTitle(t *testing.T) {
 		if _, got, ok := ChatID(e.Path); ok && got == id && e.Title != "Renamed chat" {
 			t.Errorf("%s: Title = %q, want the renamed title", e.Path, e.Title)
 		}
+	}
+}
+
+// A project folder with a lowercase drive letter is the same Windows folder as
+// the uppercase spelling: push must not upload it twice or delete its remote copy.
+func TestWindowsLowercaseDriveFolderSyncsAsOne(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("only Windows folders ignore case")
+	}
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	env.syncer.paths, _ = NewPathMapper(`C:\Users\Alice`, nil)
+	const lower = "projects/c--Users-Alice-proj/a.jsonl"
+	const canonical = "projects/C--Users-Alice-proj/a.jsonl"
+
+	writeFile(t, env.claudeDir, lower, `{"type":"user"}`+"\n")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if _, err := env.store.Head(ctx, env.syncer.remoteKey(canonical)); err != nil {
+		t.Fatalf("not uploaded under the home token: %v", err)
+	}
+
+	// A sync record written before the fix holds the lowercase spelling
+	env.syncer.state.Files[lower] = env.syncer.state.Files[canonical]
+	delete(env.syncer.state.Files, canonical)
+	env.syncer.state.CanonicalizePaths(env.syncer.paths.CanonicalRelPath)
+
+	if _, err := env.syncer.Pull(ctx); err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	entries, err := env.syncer.Diff(ctx)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+	for _, e := range entries {
+		if e.Status != DiffSynced {
+			t.Errorf("diff %s = %s, want synced", e.Path, e.Status)
+		}
+	}
+	result, err := env.syncer.Push(ctx)
+	if err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+	if len(result.Uploaded)+len(result.Deleted) != 0 {
+		t.Errorf("second push uploaded %v, deleted %v", result.Uploaded, result.Deleted)
+	}
+}
+
+// A transcript changed on both sides is a conflict only when each side has
+// messages the other lacks; a newer cost-state line alone never counts.
+func TestPullConflictOnlyWhenTranscriptsDiverge(t *testing.T) {
+	const (
+		m1   = `{"type":"user","uuid":"u1","message":{"content":"hi"}}` + "\n"
+		m2   = `{"type":"assistant","uuid":"u2","message":{"content":"hello"}}` + "\n"
+		m3   = `{"type":"user","uuid":"u3","message":{"content":"local only"}}` + "\n"
+		m4   = `{"type":"user","uuid":"u4","message":{"content":"remote only"}}` + "\n"
+		cost = `{"type":"cost-state","totalDuration":%d}` + "\n"
+	)
+	cases := []struct {
+		name, local, remote string
+		wantDiff            string
+		wantConflict        bool
+		wantLocal           string // file content after pull
+	}{
+		{"only cost-state differs", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + fmt.Sprintf(cost, 3), DiffLocalChanged, false, m1 + m2 + fmt.Sprintf(cost, 2)},
+		{"local ahead", m1 + m2 + m3, m1 + m2, DiffLocalChanged, false, m1 + m2 + m3},
+		{"remote ahead", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + m4, DiffRemoteChanged, false, m1 + m2 + m4},
+		{"diverged", m1 + m2 + m3, m1 + m2 + m4, DiffBothChanged, true, m1 + m2 + m3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupTestEnv(t)
+			ctx := context.Background()
+			const chat = "projects/p/abc.jsonl"
+
+			writeFile(t, env.claudeDir, chat, m1)
+			if _, err := env.syncer.Push(ctx); err != nil {
+				t.Fatalf("Push failed: %v", err)
+			}
+			writeFile(t, env.claudeDir, chat, tc.local)
+			encrypted, _ := env.syncer.encryptor.Encrypt([]byte(tc.remote))
+			if err := env.store.Upload(ctx, env.syncer.remoteKey(chat), encrypted); err != nil {
+				t.Fatal(err)
+			}
+
+			entries, err := env.syncer.Diff(ctx)
+			if err != nil {
+				t.Fatalf("Diff failed: %v", err)
+			}
+			for _, e := range entries {
+				if e.Path == chat && e.Status != tc.wantDiff {
+					t.Errorf("diff = %s, want %s", e.Status, tc.wantDiff)
+				}
+			}
+
+			result, err := env.syncer.Pull(ctx)
+			if err != nil {
+				t.Fatalf("Pull failed: %v", err)
+			}
+			if got := len(result.Conflicts) > 0; got != tc.wantConflict {
+				t.Errorf("conflict = %v, want %v", got, tc.wantConflict)
+			}
+			if got := readFile(t, env.claudeDir, chat); got != tc.wantLocal {
+				t.Errorf("local after pull = %q, want %q", got, tc.wantLocal)
+			}
+			copies, _ := filepath.Glob(filepath.Join(env.claudeDir, "projects", "p", "abc.jsonl.conflict.*"))
+			if (len(copies) > 0) != tc.wantConflict {
+				t.Errorf("conflict copies = %v", copies)
+			}
+		})
 	}
 }

@@ -282,11 +282,45 @@ func (m *PathMapper) NormalizeRelPath(relPath string) string {
 		return relPath
 	}
 	for _, mp := range m.mappings {
-		if seg == mp.encLocal || strings.HasPrefix(seg, mp.encLocal+"-") {
+		if mp.ownsSegment(seg) {
 			return "projects/" + pathToken(mp.name) + seg[len(mp.encLocal):] + rest
 		}
 	}
 	return relPath
+}
+
+// CanonicalRelPath spells a mapped project directory the way this device's
+// mapping does, so every spelling of one Windows folder is one sync path.
+// Other paths are unchanged.
+func (m *PathMapper) CanonicalRelPath(relPath string) string {
+	if m == nil {
+		return relPath
+	}
+	seg, rest, ok := splitProjectsPath(relPath)
+	if !ok {
+		return relPath
+	}
+	for _, mp := range m.mappings {
+		if mp.ownsSegment(seg) {
+			return "projects/" + mp.encLocal + seg[len(mp.encLocal):] + rest
+		}
+	}
+	return relPath
+}
+
+// ownsSegment reports whether a project directory name lies under this
+// mapping's local path. Windows paths ignore case, and Claude Code names a
+// folder after the working directory as given, so a lowercase drive letter
+// (as VS Code passes it) is the same folder as an uppercase one.
+func (mp *pathMapping) ownsSegment(seg string) bool {
+	n := len(mp.encLocal)
+	if len(seg) < n || (len(seg) > n && seg[n] != '-') {
+		return false
+	}
+	if mp.windows {
+		return strings.EqualFold(seg[:n], mp.encLocal)
+	}
+	return seg[:n] == mp.encLocal
 }
 
 // ResolveRelPath rewrites a portable remote path back to a local relative

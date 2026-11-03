@@ -297,3 +297,30 @@ func TestMigratePaths(t *testing.T) {
 		t.Errorf("second migrate should migrate nothing, got %v", result2.Migrated)
 	}
 }
+
+// Claude Code names a project folder after the working directory as given, so
+// a Windows device can hold "c--Users-..." while its home encodes as "C--Users-...".
+func TestWindowsDriveLetterCaseMapsToHome(t *testing.T) {
+	m, err := NewPathMapper(`C:\Users\Alice`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const lower = "projects/c--Users-Alice-proj/a.jsonl"
+	if got, want := m.NormalizeRelPath(lower), "projects/"+pathToken("HOME")+"-proj/a.jsonl"; got != want {
+		t.Errorf("NormalizeRelPath = %q, want %q", got, want)
+	}
+	if got, want := m.CanonicalRelPath(lower), "projects/C--Users-Alice-proj/a.jsonl"; got != want {
+		t.Errorf("CanonicalRelPath = %q, want %q", got, want)
+	}
+	for _, p := range []string{"projects/c--Users-Alicex-proj/a.jsonl", "projects/G--Drive-proj/a.jsonl", "settings.json"} {
+		if got := m.CanonicalRelPath(p); got != p {
+			t.Errorf("CanonicalRelPath(%q) = %q, want unchanged", p, got)
+		}
+	}
+
+	// POSIX paths are case-sensitive: no folding
+	posix, _ := NewPathMapper("/Users/alice", nil)
+	if got := posix.NormalizeRelPath("projects/-users-alice-proj/a.jsonl"); got != "projects/-users-alice-proj/a.jsonl" {
+		t.Errorf("POSIX path was case-folded: %q", got)
+	}
+}

@@ -629,3 +629,22 @@ func TestRemoteChangedIgnoresSubSecondPrecision(t *testing.T) {
 		t.Error("a later upload should count as a remote change")
 	}
 }
+
+func TestCanonicalizePathsKeepsCanonicalEntry(t *testing.T) {
+	s := NewState()
+	s.Files["projects/c--Users-Alice-p/a.jsonl"] = &FileState{Path: "projects/c--Users-Alice-p/a.jsonl", Hash: "old"}
+	s.Files["projects/C--Users-Alice-p/a.jsonl"] = &FileState{Path: "projects/C--Users-Alice-p/a.jsonl", Hash: "pulled"}
+	s.Files["projects/c--Users-Alice-p/b.jsonl"] = &FileState{Path: "projects/c--Users-Alice-p/b.jsonl", Hash: "b"}
+	m, _ := NewPathMapper(`C:\Users\Alice`, nil)
+	s.CanonicalizePaths(m.CanonicalRelPath)
+
+	if len(s.Files) != 2 {
+		t.Fatalf("Files = %v, want 2 canonical entries", s.Files)
+	}
+	if f := s.Files["projects/C--Users-Alice-p/a.jsonl"]; f == nil || f.Hash != "pulled" {
+		t.Errorf("canonical entry not kept: %+v", f)
+	}
+	if f := s.Files["projects/C--Users-Alice-p/b.jsonl"]; f == nil || f.Path != "projects/C--Users-Alice-p/b.jsonl" {
+		t.Errorf("entry not re-keyed: %+v", f)
+	}
+}

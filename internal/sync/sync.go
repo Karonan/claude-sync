@@ -109,6 +109,7 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 	if err != nil {
 		return nil, err
 	}
+	state.CanonicalizePaths(mapper.CanonicalRelPath)
 
 	return &Syncer{
 		storage:   store,
@@ -125,6 +126,9 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 func NewSyncerWith(cfg *config.Config, store storage.Storage, enc *crypto.Encryptor, state *SyncState, claudeDir string, quiet bool) *Syncer {
 	homeDir, _ := os.UserHomeDir()
 	mapper, _ := NewPathMapper(homeDir, cfg.PathMap)
+	if state != nil {
+		state.CanonicalizePaths(mapper.CanonicalRelPath)
+	}
 	return &Syncer{
 		storage:   store,
 		encryptor: enc,
@@ -180,7 +184,11 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 
 	s.progress(ProgressEvent{Action: "scan", Path: "Detecting changes..."})
 
-	changes, err := s.state.DetectChanges(s.claudeDir, s.syncPaths(), s.isExcluded)
+	localFiles, err := s.localFiles()
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect changes: %w", err)
+	}
+	changes, err := s.state.changesIn(s.claudeDir, localFiles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect changes: %w", err)
 	}
@@ -307,7 +315,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	}
 
 	// Get current local files
-	localFiles, err := GetLocalFiles(s.claudeDir, s.syncPaths(), s.isExcluded)
+	localFiles, err := s.localFiles()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local files: %w", err)
 	}
@@ -335,6 +343,15 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 				// Check if local was also modified
 				localHash, _ := HashFile(filepath.Join(s.claudeDir, localPath))
 				if localHash != stateFile.Hash {
+					switch s.compareTranscript(ctx, localPath, remoteObj) {
+					case transcriptLocalAhead:
+						// Remote adds nothing: keep local, push uploads it
+						s.state.MarkRemote(localPath, remoteObj.LastModified)
+						continue
+					case transcriptRemoteAhead:
+						toDownload = append(toDownload, downloadTask{localPath, remoteObj})
+						continue
+					}
 					// Conflict: both changed
 					result.Conflicts = append(result.Conflicts, localPath)
 					s.progress(ProgressEvent{
@@ -429,7 +446,26 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 }
 
 func (s *Syncer) Status(ctx context.Context) ([]FileChange, error) {
-	return s.state.DetectChanges(s.claudeDir, s.syncPaths(), s.isExcluded)
+	localFiles, err := s.localFiles()
+	if err != nil {
+		return nil, err
+	}
+	return s.state.changesIn(s.claudeDir, localFiles)
+}
+
+// localFiles lists this device's synced files keyed by canonical path, so a
+// project folder spelled with a lowercase drive letter lines up with its
+// remote copy and its sync record.
+func (s *Syncer) localFiles() (map[string]os.FileInfo, error) {
+	files, err := GetLocalFiles(s.claudeDir, s.syncPaths(), s.isExcluded)
+	if err != nil {
+		return nil, err
+	}
+	canonical := make(map[string]os.FileInfo, len(files))
+	for p, fi := range files {
+		canonical[s.paths.CanonicalRelPath(p)] = fi
+	}
+	return canonical, nil
 }
 
 func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
@@ -539,6 +575,83 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey strin
 	return nil
 }
 
+type transcriptRelation int
+
+const (
+	transcriptDiverged    transcriptRelation = iota // each side has lines the other lacks
+	transcriptLocalAhead                            // remote has nothing local lacks (or they match)
+	transcriptRemoteAhead                           // local has nothing remote lacks
+)
+
+// compareTranscript compares a .jsonl file on this device with its remote copy.
+// Transcripts only grow, so when one side holds every line of the other,
+// keeping that side loses nothing. Both are compared with paths in remote form,
+// ignoring the cost-state line Claude Code rewrites on its own (session
+// duration and cost totals). Any other file, or a failed read, is diverged.
+func (s *Syncer) compareTranscript(ctx context.Context, relPath string, obj storage.ObjectInfo) transcriptRelation {
+	if !strings.HasSuffix(relPath, ".jsonl") {
+		return transcriptDiverged
+	}
+	local, err := os.ReadFile(filepath.Join(s.claudeDir, filepath.FromSlash(relPath)))
+	if err != nil {
+		return transcriptDiverged
+	}
+	if IsPortableContentPath(relPath) {
+		local = s.paths.NormalizeContent(relPath, local)
+	}
+	remote, err := s.decryptRemote(ctx, obj.Key)
+	if err != nil {
+		return transcriptDiverged
+	}
+	l, r := transcriptLines(local), transcriptLines(remote)
+	switch {
+	case containsAll(l, r):
+		return transcriptLocalAhead
+	case containsAll(r, l):
+		return transcriptRemoteAhead
+	}
+	return transcriptDiverged
+}
+
+// transcriptLines keys each line by what identifies it: a message by its uuid
+// (path spellings inside it can differ between devices after path mapping), a
+// request blob by its hash, anything else by its text.
+func transcriptLines(data []byte) map[string]bool {
+	lines := map[string]bool{}
+	for _, l := range bytes.Split(data, []byte("\n")) {
+		l = bytes.TrimSuffix(l, []byte("\r"))
+		if len(bytes.TrimSpace(l)) == 0 {
+			continue
+		}
+		var id struct {
+			Type string `json:"type"`
+			UUID string `json:"uuid"`
+			Hash string `json:"hash"`
+		}
+		_ = json.Unmarshal(l, &id)
+		switch {
+		case id.Type == "cost-state":
+			continue
+		case id.UUID != "":
+			lines["uuid:"+id.UUID] = true
+		case id.Hash != "":
+			lines[id.Type+":"+id.Hash] = true
+		default:
+			lines["text:"+string(l)] = true
+		}
+	}
+	return lines
+}
+
+func containsAll(have, want map[string]bool) bool {
+	for l := range want {
+		if !have[l] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Syncer) handleConflict(ctx context.Context, relativePath string, remoteObj storage.ObjectInfo) error {
 	s.log("Conflict detected: %s (keeping local, saving remote as .conflict)", relativePath)
 
@@ -636,7 +749,8 @@ func (s *Syncer) remoteKey(relativePath string) string {
 // localPath maps a remote key back to a local relative path. ok is false when
 // the key uses a path_map token this device doesn't define.
 func (s *Syncer) localPath(remoteKey string) (string, bool) {
-	return s.paths.ResolveRelPath(strings.TrimSuffix(remoteKey, ".age"))
+	p, ok := s.paths.ResolveRelPath(strings.TrimSuffix(remoteKey, ".age"))
+	return s.paths.CanonicalRelPath(p), ok
 }
 
 // buildRemoteMap maps remote objects to local relative paths, skipping
@@ -722,7 +836,7 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 	remoteFiles, _ := s.buildRemoteMap(remoteObjects)
 
 	// Get current local files
-	localFiles, err := GetLocalFiles(s.claudeDir, s.syncPaths(), s.isExcluded)
+	localFiles, err := s.localFiles()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local files: %w", err)
 	}
@@ -817,7 +931,7 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 	var entries []DiffEntry
 
 	// Get local files
-	localFiles, err := GetLocalFiles(s.claudeDir, s.syncPaths(), s.isExcluded)
+	localFiles, err := s.localFiles()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local files: %w", err)
 	}
@@ -841,7 +955,15 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 				remoteChanged := stateFile.RemoteChanged(remoteObj.LastModified)
 				switch {
 				case localChanged && remoteChanged:
-					e.Status = DiffBothChanged
+					// Same check pull makes before saving a .conflict copy
+					switch s.compareTranscript(ctx, relPath, remoteObj) {
+					case transcriptLocalAhead:
+						e.Status = DiffLocalChanged
+					case transcriptRemoteAhead:
+						e.Status = DiffRemoteChanged
+					default:
+						e.Status = DiffBothChanged
+					}
 				case localChanged:
 					e.Status = DiffLocalChanged
 				case remoteChanged:
