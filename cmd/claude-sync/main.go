@@ -1420,6 +1420,31 @@ func diffCmd() *cobra.Command {
 			section("Push will upload from this device", sync.DiffLocalNew, sync.DiffLocalChanged)
 			section("Push will delete from the cloud (chat deleted in the desktop app)", sync.DiffChatDeleted)
 			section("Deleted on this device: push deletes it from the cloud, pull brings it back", sync.DiffLocalDeleted)
+			if excluded := groups[sync.DiffExcluded]; len(excluded) > 0 {
+				// Usually whole folders: one line per folder instead of every file
+				counts := map[string]int{}
+				for _, e := range excluded {
+					key := e.Path
+					if parts := strings.SplitN(e.Path, "/", 3); len(parts) == 3 {
+						key = parts[0] + "/" + parts[1] + "/"
+					}
+					counts[key]++
+				}
+				keys := make([]string, 0, len(counts))
+				for k := range counts {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				fmt.Printf("%sExcluded now: push deletes it from the cloud, this device keeps it (%d)%s\n", colorCyan, len(excluded), colorReset)
+				for _, k := range keys {
+					if strings.HasSuffix(k, "/") {
+						fmt.Printf("  %s%-8s%s%s %s(%d files)%s\n", colorDim, "deleted", colorReset, k, colorDim, counts[k], colorReset)
+					} else {
+						fmt.Printf("  %s%-8s%s%s\n", colorDim, "deleted", colorReset, k)
+					}
+				}
+				fmt.Println()
+			}
 			section("Pull will download to this device", sync.DiffRemoteNew, sync.DiffRemoteChanged)
 			section("Changed on both sides: pull keeps yours and saves the cloud copy as .conflict", sync.DiffBothChanged)
 			section("Different, but no sync record says which side changed", sync.DiffUnknown)

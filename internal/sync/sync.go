@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -583,13 +584,21 @@ const (
 	transcriptRemoteAhead                           // local has nothing remote lacks
 )
 
+// knownMarketplacesPath gets a fresh lastUpdated from Claude Code whenever it
+// checks a marketplace for updates, so both devices change it without the user
+// doing anything.
+const knownMarketplacesPath = "plugins/known_marketplaces.json"
+
 // compareTranscript compares a .jsonl file on this device with its remote copy.
 // Transcripts only grow, so when one side holds every line of the other,
 // keeping that side loses nothing. Both are compared with paths in remote form,
 // ignoring the cost-state line Claude Code rewrites on its own (session
-// duration and cost totals). Any other file, or a failed read, is diverged.
+// duration and cost totals). known_marketplaces.json copies that differ only
+// in lastUpdated take the remote one. Any other file, or a failed read, is
+// diverged.
 func (s *Syncer) compareTranscript(ctx context.Context, relPath string, obj storage.ObjectInfo) transcriptRelation {
-	if !strings.HasSuffix(relPath, ".jsonl") {
+	marketplaces := relPath == knownMarketplacesPath
+	if !strings.HasSuffix(relPath, ".jsonl") && !marketplaces {
 		return transcriptDiverged
 	}
 	local, err := os.ReadFile(filepath.Join(s.claudeDir, filepath.FromSlash(relPath)))
@@ -601,6 +610,12 @@ func (s *Syncer) compareTranscript(ctx context.Context, relPath string, obj stor
 	}
 	remote, err := s.decryptRemote(ctx, obj.Key)
 	if err != nil {
+		return transcriptDiverged
+	}
+	if marketplaces {
+		if sameIgnoringLastUpdated(local, remote) {
+			return transcriptRemoteAhead
+		}
 		return transcriptDiverged
 	}
 	l, r := transcriptLines(local), transcriptLines(remote)
@@ -641,6 +656,31 @@ func transcriptLines(data []byte) map[string]bool {
 		}
 	}
 	return lines
+}
+
+// sameIgnoringLastUpdated reports whether two JSON documents are equal once
+// every "lastUpdated" field is left out.
+func sameIgnoringLastUpdated(a, b []byte) bool {
+	var x, y any
+	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
+		return false
+	}
+	return reflect.DeepEqual(withoutLastUpdated(x), withoutLastUpdated(y))
+}
+
+func withoutLastUpdated(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		delete(v, "lastUpdated")
+		for k, e := range v {
+			v[k] = withoutLastUpdated(e)
+		}
+	case []any:
+		for i, e := range v {
+			v[i] = withoutLastUpdated(e)
+		}
+	}
+	return v
 }
 
 func containsAll(have, want map[string]bool) bool {
@@ -921,6 +961,7 @@ const (
 	DiffLocalChanged  = "local_changed"  // push uploads it
 	DiffLocalDeleted  = "local_deleted"  // push deletes it from remote; pull restores it
 	DiffChatDeleted   = "chat_deleted"   // deleted in the desktop app: push deletes it from remote, pull leaves it
+	DiffExcluded      = "excluded"       // excluded since it was synced: push deletes it from remote, pull ignores it
 	DiffRemoteNew     = "remote_new"     // pull downloads it
 	DiffRemoteChanged = "remote_changed" // pull downloads it
 	DiffBothChanged   = "both_changed"   // pull keeps local, saves remote as .conflict
@@ -991,6 +1032,15 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 				status = DiffLocalDeleted
 			}
 			entries = append(entries, DiffEntry{Path: relPath, Status: status, RemoteSize: obj.Size, RemoteTime: obj.LastModified})
+		}
+	}
+
+	// buildRemoteMap hides excluded files, but push still deletes the ones it
+	// synced before the exclude, since they're in state and no longer local.
+	for _, obj := range remoteObjects {
+		relPath, ok := s.localPath(obj.Key)
+		if ok && strings.HasSuffix(obj.Key, ".age") && !IsConflictCopy(relPath) && s.isExcluded(relPath) && s.state.GetFile(relPath) != nil {
+			entries = append(entries, DiffEntry{Path: relPath, Status: DiffExcluded, RemoteSize: obj.Size, RemoteTime: obj.LastModified})
 		}
 	}
 

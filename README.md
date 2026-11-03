@@ -300,7 +300,7 @@ claude-sync keeps a record of every file it synced (`~/.claude-sync/state.json`)
 **Pull** downloads files that are new or changed in the cloud:
 
 - A file that changed only in the cloud replaces your copy.
-- A file that changed on both sides is a **conflict**: your copy is kept and the cloud copy is saved next to it as `<file>.conflict.<timestamp>` (see [Conflict Resolution](#conflict-resolution)). Chats are checked first: they only grow, so if one side already has every message of the other, pull keeps that side and there is no conflict. A chat only conflicts when you continued it on two devices without syncing in between. The session-duration and cost line Claude Code rewrites on its own is ignored.
+- A file that changed on both sides is a **conflict**: your copy is kept and the cloud copy is saved next to it as `<file>.conflict.<timestamp>` (see [Conflict Resolution](#conflict-resolution)). Chats are checked first: they only grow, so if one side already has every message of the other, pull keeps that side and there is no conflict. A chat only conflicts when you continued it on two devices without syncing in between. The session-duration and cost line Claude Code rewrites on its own is ignored. Likewise `plugins/known_marketplaces.json` copies that differ only in their `lastUpdated` times (Claude Code sets them each time it checks for plugin updates) take the cloud copy without a conflict.
 - A file you deleted here but haven't pushed yet is downloaded again. Push first if you want the deletion to stick. Desktop app chats are the exception, see below.
 
 Whether the cloud copy changed is decided from the cloud's own timestamps, so a device whose clock is off doesn't cause false conflicts.
@@ -324,6 +324,14 @@ Pull will download to this device (1)
   new     chat "Trip planning"  (Documents-notes)
 
 2031 files in sync, 5 waiting for push or pull
+```
+
+If you exclude something that was synced before, push deletes it from the cloud (this device keeps it), and `diff` warns first, one line per folder:
+
+```
+Excluded now: push deletes it from the cloud, this device keeps it (1218)
+  deleted plugins/plugin-catalog-cache.json
+  deleted plugins/synced/ (1217 files)
 ```
 
 Two more sections appear when needed: **Changed on both sides** (pull keeps yours and saves the cloud copy as `.conflict`) and **Different, but no sync record says which side changed**.

@@ -984,6 +984,39 @@ func TestWindowsLowercaseDriveFolderSyncsAsOne(t *testing.T) {
 
 // A transcript changed on both sides is a conflict only when each side has
 // messages the other lacks; a newer cost-state line alone never counts.
+func TestDiffShowsExcludedFilesPushWillDelete(t *testing.T) {
+	env := setupTestEnv(t)
+	ctx := context.Background()
+	writeFile(t, env.claudeDir, "plugins/cachey/a.json", "{}")
+	writeFile(t, env.claudeDir, "CLAUDE.md", "hi")
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatal(err)
+	}
+	env.syncer.cfg.Exclude = []string{"plugins/cachey/**"}
+
+	statusOf := func() string {
+		entries, err := env.syncer.Diff(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if e.Path == "plugins/cachey/a.json" {
+				return e.Status
+			}
+		}
+		return ""
+	}
+	if got := statusOf(); got != DiffExcluded {
+		t.Fatalf("before push: status = %q, want %q", got, DiffExcluded)
+	}
+	if _, err := env.syncer.Push(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := statusOf(); got != "" {
+		t.Errorf("after push: status = %q, want it gone", got)
+	}
+}
+
 func TestPullConflictOnlyWhenTranscriptsDiverge(t *testing.T) {
 	const (
 		m1   = `{"type":"user","uuid":"u1","message":{"content":"hi"}}` + "\n"
@@ -991,23 +1024,30 @@ func TestPullConflictOnlyWhenTranscriptsDiverge(t *testing.T) {
 		m3   = `{"type":"user","uuid":"u3","message":{"content":"local only"}}` + "\n"
 		m4   = `{"type":"user","uuid":"u4","message":{"content":"remote only"}}` + "\n"
 		cost = `{"type":"cost-state","totalDuration":%d}` + "\n"
+		mp   = `{"official":{"repo":"a/b","lastUpdated":"%s"}%s}`
 	)
 	cases := []struct {
 		name, local, remote string
 		wantDiff            string
 		wantConflict        bool
 		wantLocal           string // file content after pull
+		path                string // default: a chat transcript
 	}{
-		{"only cost-state differs", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + fmt.Sprintf(cost, 3), DiffLocalChanged, false, m1 + m2 + fmt.Sprintf(cost, 2)},
-		{"local ahead", m1 + m2 + m3, m1 + m2, DiffLocalChanged, false, m1 + m2 + m3},
-		{"remote ahead", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + m4, DiffRemoteChanged, false, m1 + m2 + m4},
-		{"diverged", m1 + m2 + m3, m1 + m2 + m4, DiffBothChanged, true, m1 + m2 + m3},
+		{"only cost-state differs", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + fmt.Sprintf(cost, 3), DiffLocalChanged, false, m1 + m2 + fmt.Sprintf(cost, 2), ""},
+		{"local ahead", m1 + m2 + m3, m1 + m2, DiffLocalChanged, false, m1 + m2 + m3, ""},
+		{"remote ahead", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + m4, DiffRemoteChanged, false, m1 + m2 + m4, ""},
+		{"diverged", m1 + m2 + m3, m1 + m2 + m4, DiffBothChanged, true, m1 + m2 + m3, ""},
+		{"marketplaces only lastUpdated differs", fmt.Sprintf(mp, "1", ""), fmt.Sprintf(mp, "2", ""), DiffRemoteChanged, false, fmt.Sprintf(mp, "2", ""), knownMarketplacesPath},
+		{"marketplaces really differ", fmt.Sprintf(mp, "1", `,"mine":{}`), fmt.Sprintf(mp, "2", `,"theirs":{}`), DiffBothChanged, true, fmt.Sprintf(mp, "1", `,"mine":{}`), knownMarketplacesPath},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			env := setupTestEnv(t)
 			ctx := context.Background()
-			const chat = "projects/p/abc.jsonl"
+			chat := "projects/p/abc.jsonl"
+			if tc.path != "" {
+				chat = tc.path
+			}
 
 			writeFile(t, env.claudeDir, chat, m1)
 			if _, err := env.syncer.Push(ctx); err != nil {
@@ -1039,7 +1079,7 @@ func TestPullConflictOnlyWhenTranscriptsDiverge(t *testing.T) {
 			if got := readFile(t, env.claudeDir, chat); got != tc.wantLocal {
 				t.Errorf("local after pull = %q, want %q", got, tc.wantLocal)
 			}
-			copies, _ := filepath.Glob(filepath.Join(env.claudeDir, "projects", "p", "abc.jsonl.conflict.*"))
+			copies, _ := filepath.Glob(filepath.Join(env.claudeDir, filepath.FromSlash(chat)+".conflict.*"))
 			if (len(copies) > 0) != tc.wantConflict {
 				t.Errorf("conflict copies = %v", copies)
 			}
