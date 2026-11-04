@@ -596,6 +596,9 @@ func TestDefaultExcludesApplyWithoutConfig(t *testing.T) {
 	if !c.IsExcluded("plugins/synced/acct_org/manifest.json") {
 		t.Error("account plugins kept by the Claude app should be excluded by default")
 	}
+	if !c.IsExcluded("plugins/plugin-directory-cache-v2.json") || !c.IsExcluded("plugins/plugin-catalog-cache.json") {
+		t.Error("plugin directory caches should be excluded by default")
+	}
 	if c.IsExcluded("plugins/cache/ponytail/ponytail/5.3.2/plugin.json") || c.IsExcluded("plugins/known_marketplaces.json") {
 		t.Error("installed plugins and the catalog list must still sync")
 	}

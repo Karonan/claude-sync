@@ -34,6 +34,7 @@ type DesktopPushResult struct {
 type DesktopPullResult struct {
 	Added        []string // titles of chats added to the sidebar
 	Removed      []string // titles of chats removed because another device deleted them
+	Updated      []string // titles of chats moved on to a newer transcript on another device
 	Generated    []string // titles of entries built from VS Code/desktop transcripts
 	Waiting      int      // entries whose transcript hasn't been pulled yet
 	NoRemote     bool
@@ -133,9 +134,10 @@ func (s *Syncer) isDeletedChatFile(relPath string) bool {
 }
 
 type desktopEntryHeader struct {
-	SessionID    string `json:"sessionId"`
-	CLISessionID string `json:"cliSessionId"`
-	Title        string `json:"title"`
+	SessionID      string  `json:"sessionId"`
+	CLISessionID   string  `json:"cliSessionId"`
+	Title          string  `json:"title"`
+	LastActivityAt float64 `json:"lastActivityAt"`
 }
 
 // ReadDesktopEntries reads every sidebar entry under dir/<account>/<org>/.
@@ -282,9 +284,10 @@ func (s *Syncer) PushDesktop(ctx context.Context) (*DesktopPushResult, error) {
 }
 
 // PullDesktop adds sidebar entries for remote desktop chats whose transcript
-// is present locally. Existing entries are never changed, and chats this
-// device has seen before (then deleted) are skipped. Entries for chats the app
-// deleted on another device are removed; their transcripts stay.
+// is present locally, and moves an existing entry on to a newer transcript when
+// another device continued that chat in one. Chats this device has seen before
+// (then deleted) are skipped. Entries for chats the app deleted on another
+// device are removed.
 func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 	dir := s.cfg.GetDesktopSessionsDir()
 	if dir == "" {
@@ -322,8 +325,49 @@ func (s *Syncer) PullDesktop(ctx context.Context) (*DesktopPullResult, error) {
 		}
 	}
 	sort.Strings(result.Removed)
+
+	// One sidebar chat (sessionId) moves to a new transcript (cliSessionId)
+	// when the app continues it in a fresh one, so several remote entries can
+	// share a sessionId. Only the most recently active one is current.
+	current := map[string]desktopEntryHeader{}
+	for _, raw := range remote {
+		var h desktopEntryHeader
+		if json.Unmarshal(raw, &h) == nil && h.LastActivityAt >= current[h.SessionID].LastActivityAt {
+			current[h.SessionID] = h
+		}
+	}
+	localBySession := map[string]desktopEntryHeader{}
+	for _, raw := range local {
+		var h desktopEntryHeader
+		if json.Unmarshal(raw, &h) == nil {
+			localBySession[h.SessionID] = h
+		}
+	}
+
 	for _, id := range ids {
-		if _, ok := local[id]; ok || s.state.isDesktopSeen(id) || !desktopCLIIDRe.MatchString(id) || s.isDeletedChat(id) {
+		if _, ok := local[id]; ok || !desktopCLIIDRe.MatchString(id) || s.isDeletedChat(id) {
+			continue
+		}
+		var rh desktopEntryHeader
+		if json.Unmarshal(remote[id], &rh) == nil && current[rh.SessionID].CLISessionID != id {
+			s.state.markDesktopSeen(id) // an older transcript of a chat that moved on
+			continue
+		}
+		if lh, ok := localBySession[rh.SessionID]; ok {
+			// This device's entry for the chat still points at an older transcript
+			if rh.LastActivityAt > lh.LastActivityAt && s.hasTranscript(id) && !s.isCLIChat(id) {
+				title, err := s.replaceDesktopEntry(dir, id, remote[id])
+				if err != nil {
+					return nil, err
+				}
+				if title != "" {
+					s.state.markDesktopSeen(lh.CLISessionID)
+					result.Updated = append(result.Updated, title)
+				}
+			}
+			continue
+		}
+		if s.state.isDesktopSeen(id) {
 			continue
 		}
 		if !s.hasTranscript(id) {
@@ -620,6 +664,24 @@ func removeDesktopEntry(dir string, raw json.RawMessage) (string, error) {
 			return "", fmt.Errorf("failed to remove desktop entry: %w", err)
 		}
 	}
+	return h.Title, nil
+}
+
+// replaceDesktopEntry overwrites this device's sidebar entry for the same
+// chat with the remote one for transcript id, and returns the chat's title.
+func (s *Syncer) replaceDesktopEntry(dir, id string, remoteRaw json.RawMessage) (string, error) {
+	raw := s.paths.ResolveContent(desktopContentPath, remoteRaw)
+	var h desktopEntryHeader
+	if json.Unmarshal(raw, &h) != nil || h.CLISessionID != id || !desktopSessionIDRe.MatchString(h.SessionID) {
+		return "", nil
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*", "*", h.SessionID+".json"))
+	for _, f := range files {
+		if err := os.WriteFile(f, raw, 0600); err != nil {
+			return "", fmt.Errorf("failed to update desktop entry: %w", err)
+		}
+	}
+	s.state.markDesktopSeen(id)
 	return h.Title, nil
 }
 

@@ -3118,9 +3118,15 @@ func runDesktopPull(ctx context.Context, syncer *sync.Syncer) error {
 	for _, title := range result.Removed {
 		fmt.Printf("  %s-%s %s\n", colorYellow, colorReset, title)
 	}
+	for _, title := range result.Updated {
+		fmt.Printf("  %s~%s %s\n", colorCyan, colorReset, title)
+	}
 	fmt.Printf("%s✓%s Desktop chats: %s%d added%s", colorGreen, colorReset, colorGreen, len(result.Added)+len(result.Generated), colorReset)
 	if len(result.Removed) > 0 {
 		fmt.Printf(", %d removed (deleted on another device)", len(result.Removed))
+	}
+	if len(result.Updated) > 0 {
+		fmt.Printf(", %d moved to their newer transcript", len(result.Updated))
 	}
 	if len(result.Generated) > 0 {
 		fmt.Printf(" (%d from VS Code/desktop transcripts)", len(result.Generated))
@@ -3129,7 +3135,7 @@ func runDesktopPull(ctx context.Context, syncer *sync.Syncer) error {
 		fmt.Printf(", %d waiting for their transcript", result.Waiting)
 	}
 	fmt.Println()
-	if len(result.Added)+len(result.Generated)+len(result.Removed) > 0 {
+	if len(result.Added)+len(result.Generated)+len(result.Removed)+len(result.Updated) > 0 {
 		fmt.Printf("  %sRestart the Claude desktop app to see the changes.%s\n", colorDim, colorReset)
 	}
 	return nil

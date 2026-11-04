@@ -160,6 +160,55 @@ func TestDesktopPullNeverResurrectsOrOverwrites(t *testing.T) {
 	}
 }
 
+func TestDesktopPullFollowsChatToNewerTranscript(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStorage()
+	a := newDesktopDevice(t, store, nil)
+	b := newDesktopDevice(t, store, a.syncer)
+	write := func(d *desktopDevice, cliID string, at int64) {
+		data, _ := json.Marshal(map[string]any{"sessionId": "local_chat", "cliSessionId": cliID, "title": "Chat", "lastActivityAt": at})
+		if err := os.WriteFile(filepath.Join(d.entryDir, "local_chat.json"), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := func() string {
+		var h desktopEntryHeader
+		data, _ := os.ReadFile(filepath.Join(b.entryDir, "local_chat.json"))
+		_ = json.Unmarshal(data, &h)
+		return h.CLISessionID
+	}
+
+	// A continues the chat in a new transcript; the cloud keeps both entries
+	write(a, "cli-old", 100)
+	if _, err := a.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write(a, "cli-new", 200)
+	if _, err := a.syncer.PushDesktop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.addTranscript(t, "cli-old")
+	b.addTranscript(t, "cli-new")
+	write(b, "cli-old", 100)
+
+	r, err := b.syncer.PullDesktop(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Updated) != 1 || len(r.Added) != 0 || len(r.Generated) != 0 || current() != "cli-new" {
+		t.Fatalf("pull: %+v, entry -> %s", r, current())
+	}
+	if r, _ = b.syncer.PullDesktop(ctx); len(r.Updated)+len(r.Added)+len(r.Generated) != 0 {
+		t.Fatalf("second pull changed something: %+v", r)
+	}
+
+	// B's entry is the newer one: pull leaves it alone
+	write(b, "cli-old", 300)
+	if r, _ = b.syncer.PullDesktop(ctx); len(r.Updated) != 0 || current() != "cli-old" {
+		t.Fatalf("newer local entry was replaced: %+v", r)
+	}
+}
+
 func TestDesktopPullRejectsUnsafeSessionID(t *testing.T) {
 	ctx := context.Background()
 	store := newMockStorage()

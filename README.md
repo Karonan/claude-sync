@@ -215,6 +215,7 @@ Never synced:
 
 - `plugins/marketplaces/` (built in): plugin catalogs. Claude Code downloads them itself from the sources in `plugins/known_marketplaces.json`, and each refresh rewrites hundreds of files.
 - `plugins/synced/` (built in): plugins from your claude.ai account, which the Claude app downloads and updates on each device itself.
+- `plugins/plugin-directory-cache-v2.json` and `plugins/plugin-catalog-cache.json` (built in): Claude Code's downloaded copies of the online plugin directory, refreshed on each device.
 
 Installed plugins (`settings.json`, `plugins/installed_plugins.json`, `plugins/cache/`) still sync.
 - `.conflict.<timestamp>` copies: they stay on the device that made them.
@@ -344,6 +345,7 @@ The Claude desktop app keeps its own sidebar list of chats. claude-sync syncs th
 
 - **On by default** as part of every push and pull. Devices without the desktop app skip it. Turn it off with `claude-sync desktop disable` (or for one run, back on with `--include-desktop`).
 - **Chats started in the terminal or by other programs** (CLI, SDK) still sync, so `claude --resume` finds them, but they stay out of the desktop sidebar.
+- **A chat the app continued in a new transcript** on another device moves to that transcript here too, unless you used it more recently on this device.
 - **Deleting a chat** in the desktop app deletes it everywhere: on your other devices it leaves the sidebar, and their copy of its files is removed at their next pull. A file changed on that device since its last sync is kept, so nothing written only there is lost. Archiving a chat doesn't delete it.
 - After a pull adds or removes chats, restart the desktop app to see the change.
 

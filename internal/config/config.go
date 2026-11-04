@@ -376,10 +376,16 @@ func DesktopSessionsDirPath() string {
 }
 
 // DefaultExcludes are never synced, whatever the config says. Claude Code
-// re-downloads plugin catalogs from plugins/known_marketplaces.json, and the
-// Claude app keeps plugins from your claude.ai account in plugins/synced; both
-// rewrite their files on every refresh.
-var DefaultExcludes = []string{"plugins/marketplaces/**", "plugins/synced/**"}
+// re-downloads plugin catalogs from plugins/known_marketplaces.json and keeps
+// downloaded copies of the plugin directory in the *-cache files; the Claude
+// app keeps plugins from your claude.ai account in plugins/synced. All of them
+// are rewritten on every refresh.
+var DefaultExcludes = []string{
+	"plugins/marketplaces/**",
+	"plugins/synced/**",
+	"plugins/plugin-directory-cache-v2.json",
+	"plugins/plugin-catalog-cache.json",
+}
 
 // IsExcluded returns true if the given relative path matches DefaultExcludes or any exclude pattern.
 // Patterns support:
