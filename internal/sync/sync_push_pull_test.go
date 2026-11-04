@@ -1037,6 +1037,7 @@ func TestPullConflictOnlyWhenTranscriptsDiverge(t *testing.T) {
 		{"local ahead", m1 + m2 + m3, m1 + m2, DiffLocalChanged, false, m1 + m2 + m3, ""},
 		{"remote ahead", m1 + m2 + fmt.Sprintf(cost, 2), m1 + m2 + m4, DiffRemoteChanged, false, m1 + m2 + m4, ""},
 		{"diverged", m1 + m2 + m3, m1 + m2 + m4, DiffBothChanged, true, m1 + m2 + m3, ""},
+		{"local only adds a last-prompt line", m1 + `{"type":"last-prompt","lastPrompt":"hi"}` + "\n", m1 + m2 + m4, DiffRemoteChanged, false, m1 + m2 + m4, ""},
 		{"marketplaces only lastUpdated differs", fmt.Sprintf(mp, "1", ""), fmt.Sprintf(mp, "2", ""), DiffRemoteChanged, false, fmt.Sprintf(mp, "2", ""), knownMarketplacesPath},
 		{"marketplaces really differ", fmt.Sprintf(mp, "1", `,"mine":{}`), fmt.Sprintf(mp, "2", `,"theirs":{}`), DiffBothChanged, true, fmt.Sprintf(mp, "1", `,"mine":{}`), knownMarketplacesPath},
 	}

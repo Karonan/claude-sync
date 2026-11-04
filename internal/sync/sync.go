@@ -592,8 +592,8 @@ const knownMarketplacesPath = "plugins/known_marketplaces.json"
 // compareTranscript compares a .jsonl file on this device with its remote copy.
 // Transcripts only grow, so when one side holds every line of the other,
 // keeping that side loses nothing. Both are compared with paths in remote form,
-// ignoring the cost-state line Claude Code rewrites on its own (session
-// duration and cost totals). known_marketplaces.json copies that differ only
+// ignoring the cost-state and last-prompt lines Claude Code writes on its own
+// (session duration and cost totals, a bookmark of the last prompt). known_marketplaces.json copies that differ only
 // in lastUpdated take the remote one. Any other file, or a failed read, is
 // diverged.
 func (s *Syncer) compareTranscript(ctx context.Context, relPath string, obj storage.ObjectInfo) transcriptRelation {
@@ -645,7 +645,7 @@ func transcriptLines(data []byte) map[string]bool {
 		}
 		_ = json.Unmarshal(l, &id)
 		switch {
-		case id.Type == "cost-state":
+		case id.Type == "cost-state", id.Type == "last-prompt":
 			continue
 		case id.UUID != "":
 			lines["uuid:"+id.UUID] = true
