@@ -344,7 +344,8 @@ Chats are shown by the name you gave them, or else by their title or first messa
 The Claude desktop app keeps its own sidebar list of chats. claude-sync syncs that list too, so a chat you start in the desktop app (or in VS Code) shows up in the desktop sidebar on your other devices.
 
 - **On by default** as part of every push and pull. Devices without the desktop app skip it. Turn it off with `claude-sync desktop disable` (or for one run, back on with `--include-desktop`).
-- **Chats started in the terminal or by other programs** (CLI, SDK) still sync, so `claude --resume` finds them, but they stay out of the desktop sidebar.
+- **Chats started in the terminal or by other programs** (CLI, SDK) still sync, so `claude --resume` finds them, but they stay out of the desktop sidebar. Sub chats one desktop chat starts for another do show up in the sidebar.
+- **A chat with no sidebar entry in the cloud yet** (the other device hasn't pushed it) gets one built from its transcript, under the name you gave the chat.
 - **A chat the app continued in a new transcript** on another device moves to that transcript here too, unless you used it more recently on this device.
 - **Deleting a chat** in the desktop app deletes it everywhere: on your other devices it leaves the sidebar, and their copy of its files is removed at their next pull. A file changed on that device since its last sync is kept, so nothing written only there is lost. Archiving a chat doesn't delete it.
 - After a pull adds or removes chats, restart the desktop app to see the change.

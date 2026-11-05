@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/tawanorg/claude-sync/internal/config"
@@ -259,12 +260,19 @@ func TestDesktopPullAdoptsVSCodeAndDesktopTranscripts(t *testing.T) {
 	write("desk", "claude-desktop", `{"type":"ai-title","aiTitle":"Named by AI"}`)
 	write("cli", "cli")
 	write("sdk", "sdk-cli")
+	write("named", "claude-desktop", `{"type":"ai-title","aiTitle":"Named by AI"}`)
+	createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", "named", "custom-title.json"), `{"customTitle":"Renamed by me"}`)
 
 	r, err := d.syncer.PullDesktop(ctx)
 	if err != nil || !r.NoRemote {
 		t.Fatalf("pull: %+v %v", r, err)
 	}
-	if len(r.Generated) != 2 {
+	var named desktopEntryHeader
+	_ = json.Unmarshal(d.entries(t)["named"], &named)
+	if named.Title != "Renamed by me" {
+		t.Errorf("renamed chat's title = %q", named.Title)
+	}
+	if len(r.Generated) != 3 {
 		t.Fatalf("generated = %v, want the VS Code and desktop chats", r.Generated)
 	}
 	got := d.entries(t)
@@ -331,12 +339,16 @@ func TestDesktopSyncLeavesOutCLIStartedChats(t *testing.T) {
 		// A program ran `claude` from a desktop chat: inherited entrypoint, "sdk" turns
 		createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", "spawned.jsonl"),
 			`{"type":"user","entrypoint":"claude-desktop","turnOrigin":"sdk"}`+"\n")
+		// A sub chat another chat started in the app: "sdk" turn the app tags
+		createTestFile(t, d.claudeDir, filepath.Join("projects", "-proj", "sub.jsonl"),
+			`{"type":"user","entrypoint":"claude-desktop","turnOrigin":"sdk","turnAttributionKey":"k"}`+"\n")
 	}
 
 	a.addEntry(t, "local_1", "desk", "/proj", "Desktop chat")
 	a.addEntry(t, "local_2", "resumed", "/proj", "CLI chat opened in desktop")
 	a.addEntry(t, "local_3", "spawned", "/proj", "say hi")
-	if r, err := a.syncer.PushDesktop(ctx); err != nil || r.Pushed != 1 {
+	a.addEntry(t, "local_4", "sub", "/proj", "Sub chat")
+	if r, err := a.syncer.PushDesktop(ctx); err != nil || r.Pushed != 2 {
 		t.Fatalf("push: %+v %v", r, err)
 	}
 	remote, _ := a.syncer.downloadDesktopEntries(ctx)
@@ -358,8 +370,9 @@ func TestDesktopSyncLeavesOutCLIStartedChats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Added) != 1 || r.Added[0] != "Desktop chat" {
-		t.Fatalf("pull added %v, want only the desktop chat", r.Added)
+	sort.Strings(r.Added)
+	if len(r.Added) != 2 || r.Added[0] != "Desktop chat" || r.Added[1] != "Sub chat" {
+		t.Fatalf("pull added %v, want the desktop chat and the sub chat", r.Added)
 	}
 	if _, ok := b.entries(t)["resumed"]; ok {
 		t.Error("pull recreated a CLI-started chat")

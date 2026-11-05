@@ -419,9 +419,11 @@ var sidebarEntrypoints = map[string]bool{"claude-desktop": true, "claude-vscode"
 
 // sidebarStart reports whether a chat whose first user message carries these
 // fields belongs in the sidebar. Programs that run `claude` from inside a
-// desktop chat inherit its entrypoint, but their turns are marked "sdk".
-func sidebarStart(entrypoint, turnOrigin string) bool {
-	return sidebarEntrypoints[entrypoint] && turnOrigin != "sdk"
+// desktop chat inherit its entrypoint, but their turns are marked "sdk". So
+// are sub chats another chat starts in the app, but the app tags those turns
+// with a turnAttributionKey, which a program's own run doesn't get.
+func sidebarStart(entrypoint, turnOrigin, attributionKey string) bool {
+	return sidebarEntrypoints[entrypoint] && (turnOrigin != "sdk" || attributionKey != "")
 }
 
 // isCLIChat reports whether id's local transcript was started outside the
@@ -441,12 +443,13 @@ func (s *Syncer) isCLIChat(id string) bool {
 	for {
 		line, err := r.ReadBytes('\n')
 		var l struct {
-			Type       string `json:"type"`
-			Entrypoint string `json:"entrypoint"`
-			TurnOrigin string `json:"turnOrigin"`
+			Type               string `json:"type"`
+			Entrypoint         string `json:"entrypoint"`
+			TurnOrigin         string `json:"turnOrigin"`
+			TurnAttributionKey string `json:"turnAttributionKey"`
 		}
 		if json.Unmarshal(line, &l) == nil && l.Type == "user" && l.Entrypoint != "" {
-			return !sidebarStart(l.Entrypoint, l.TurnOrigin)
+			return !sidebarStart(l.Entrypoint, l.TurnOrigin, l.TurnAttributionKey)
 		}
 		if err != nil {
 			return false
@@ -495,6 +498,12 @@ func (s *Syncer) adoptTranscripts(writeDir string) (generated []string, err erro
 		info, err := readTranscriptInfo(tr)
 		if err != nil {
 			return nil, err
+		}
+		// A chat's name, once given, lives next to its transcript
+		if data, err := os.ReadFile(filepath.Join(strings.TrimSuffix(tr, ".jsonl"), "custom-title.json")); err == nil {
+			if t := customTitle(data); t != "" {
+				info.title = t
+			}
 		}
 		if !info.sidebar || info.cwd == "" || info.title == "" {
 			continue
@@ -564,20 +573,21 @@ func parseTranscriptInfo(src io.Reader) transcriptInfo {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 {
 			var l struct {
-				Entrypoint string `json:"entrypoint"`
-				TurnOrigin string `json:"turnOrigin"`
-				Type       string `json:"type"`
-				Cwd        string `json:"cwd"`
-				Timestamp  string `json:"timestamp"`
-				UUID       string `json:"uuid"`
-				AITitle    string `json:"aiTitle"`
-				Message    struct {
+				Entrypoint         string `json:"entrypoint"`
+				TurnOrigin         string `json:"turnOrigin"`
+				TurnAttributionKey string `json:"turnAttributionKey"`
+				Type               string `json:"type"`
+				Cwd                string `json:"cwd"`
+				Timestamp          string `json:"timestamp"`
+				UUID               string `json:"uuid"`
+				AITitle            string `json:"aiTitle"`
+				Message            struct {
 					Content json.RawMessage `json:"content"`
 				} `json:"message"`
 			}
 			if json.Unmarshal(line, &l) == nil {
 				if !seenEntrypoint && l.Type == "user" && l.Entrypoint != "" {
-					seenEntrypoint, info.sidebar = true, sidebarStart(l.Entrypoint, l.TurnOrigin)
+					seenEntrypoint, info.sidebar = true, sidebarStart(l.Entrypoint, l.TurnOrigin, l.TurnAttributionKey)
 				}
 				if info.cwd == "" {
 					info.cwd = l.Cwd
